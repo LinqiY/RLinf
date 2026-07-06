@@ -1064,7 +1064,11 @@ def validate_embodied_cfg(cfg):
 
         def validate_vlabench_mvp_env_cfg(env_cfg):
             assert env_cfg.env_type == "vlabench"
-            assert env_cfg.get("task_name", None), "VLABench MVP requires task_name"
+            task_names = env_cfg.get("task_names", None)
+            has_task_names = task_names is not None and len(task_names) > 0
+            assert env_cfg.get("task_name", None) or has_task_names, (
+                "VLABench requires task_name or non-empty task_names"
+            )
             assert env_cfg.get("control_mode", "ee") == "ee", (
                 "VLABench MVP only supports control_mode='ee'"
             )

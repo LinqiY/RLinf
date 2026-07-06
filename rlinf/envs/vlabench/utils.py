@@ -10,6 +10,7 @@ import sys
 from typing import Any
 
 import numpy as np
+from omegaconf import OmegaConf
 
 DEFAULT_EE_FRAME_OFFSET = np.array([0.0, -0.4, 0.78], dtype=np.float32)
 
@@ -45,12 +46,9 @@ def validate_mvp_config(cfg: Any) -> None:
         raise ValueError(f"VLABenchEnv requires env_type='vlabench', got {env_type!r}")
 
     task_name = get_cfg_value(cfg, "task_name")
-    if not task_name:
-        raise ValueError("VLABenchEnv requires a non-empty task_name")
-
-    num_envs = get_cfg_value(cfg, "num_envs", get_cfg_value(cfg, "total_num_envs", 1))
-    if num_envs not in (None, 1):
-        raise NotImplementedError("VLABenchEnv MVP only supports num_envs=1")
+    task_names = get_cfg_value(cfg, "task_names", None)
+    if not task_name and not task_names:
+        raise ValueError("VLABenchEnv requires task_name or non-empty task_names")
 
     control_mode = get_cfg_value(cfg, "control_mode", "ee")
     if control_mode != "ee":
@@ -74,6 +72,61 @@ def validate_mvp_config(cfg: Any) -> None:
 
     if bool(get_cfg_value(cfg, "require_pcd", False)):
         raise NotImplementedError("VLABenchEnv MVP requires require_pcd=false")
+
+
+def cfg_to_container(value: Any) -> Any:
+    if value is None:
+        return None
+    if OmegaConf.is_config(value):
+        return OmegaConf.to_container(value, resolve=True)
+    return value
+
+
+def normalize_task_names(cfg: Any) -> list[str]:
+    task_names = cfg_to_container(get_cfg_value(cfg, "task_names", None))
+    if task_names is None:
+        task_name = get_cfg_value(cfg, "task_name", None)
+        return [str(task_name)] if task_name else []
+    if isinstance(task_names, str):
+        task_names = [task_names]
+    names = [str(name) for name in task_names if str(name)]
+    if not names:
+        raise ValueError("VLABench task_names must contain at least one task")
+    return names
+
+
+def load_episode_configs(cfg: Any) -> list[dict] | dict[str, Any] | None:
+    path = get_cfg_value(cfg, "episode_config_path", None)
+    eval_track = get_cfg_value(cfg, "eval_track", None)
+    if path is None and isinstance(eval_track, str) and os.path.exists(eval_track):
+        path = eval_track
+    if path is None:
+        return None
+
+    loaded = OmegaConf.load(path)
+    container = cfg_to_container(loaded)
+    if isinstance(container, (list, dict)):
+        return container
+    raise ValueError(f"Unsupported VLABench episode config format at {path!r}")
+
+
+def select_episode_config(episode_configs: Any, task_name: str, rng: np.random.Generator):
+    if episode_configs is None:
+        return None
+    if isinstance(episode_configs, list):
+        if not episode_configs:
+            return None
+        return episode_configs[int(rng.integers(0, len(episode_configs)))]
+    if isinstance(episode_configs, dict):
+        task_configs = episode_configs.get(task_name)
+        if task_configs is None:
+            return None
+        if isinstance(task_configs, list):
+            if not task_configs:
+                return None
+            return task_configs[int(rng.integers(0, len(task_configs)))]
+        return task_configs
+    return None
 
 
 def normalize_ee_action(action: np.ndarray) -> np.ndarray:
