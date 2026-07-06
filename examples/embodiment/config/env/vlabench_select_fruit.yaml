@@ -18,6 +18,8 @@ gripper_open_value: 0.04
 ignore_terminations: false
 max_episode_steps: 80
 max_steps_per_rollout_epoch: 80
+auto_reset: false
+return_tensors: true
 require_pcd: false
 reset_wait_step: 10
 random_init: true

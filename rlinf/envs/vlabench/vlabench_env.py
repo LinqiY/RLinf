@@ -7,6 +7,7 @@ from __future__ import annotations
 from typing import Optional
 
 import numpy as np
+import torch
 
 try:
     import gymnasium as gym
@@ -64,8 +65,12 @@ class VLABenchEnv(gym.Env):
         self.task_name = get_cfg_value(cfg, "task_name")
         self.robot = get_cfg_value(cfg, "robot", "franka")
         self.ignore_terminations = bool(get_cfg_value(cfg, "ignore_terminations", False))
+        self.auto_reset = bool(get_cfg_value(cfg, "auto_reset", False))
+        if self.auto_reset:
+            raise NotImplementedError("VLABenchEnv Phase-2A does not support auto_reset")
         self.max_episode_steps = int(get_cfg_value(cfg, "max_episode_steps", 80))
         self.require_pcd = bool(get_cfg_value(cfg, "require_pcd", False))
+        self.return_tensors = bool(get_cfg_value(cfg, "return_tensors", False))
         self.ee_frame_offset = np.asarray(
             get_cfg_value(cfg, "ee_frame_offset", DEFAULT_EE_FRAME_OFFSET),
             dtype=np.float32,
@@ -148,6 +153,18 @@ class VLABenchEnv(gym.Env):
             "episode_return": float(self.episode_return),
         }
 
+    def _format_obs(self, obs: dict) -> dict:
+        if not self.return_tensors:
+            return obs
+
+        formatted = dict(obs)
+        for key in ("main_images", "extra_view_images", "states"):
+            if formatted.get(key, None) is not None and not isinstance(
+                formatted[key], torch.Tensor
+            ):
+                formatted[key] = torch.as_tensor(formatted[key], device="cpu").contiguous()
+        return formatted
+
     def _get_wrapped_observation(self):
         raw_obs = self.env.get_observation(require_pcd=self.require_pcd)
         obs = wrap_observation(raw_obs, self.instruction, self.cfg)
@@ -175,7 +192,7 @@ class VLABenchEnv(gym.Env):
         obs = self._get_wrapped_observation()
         info = self._get_info(success=False, ik_success=None)
         self.last_info = info
-        return obs, info
+        return self._format_obs(obs), info
 
     def step(self, action):
         ctrl_action, ik_success = ee_action_to_ctrl(
@@ -199,7 +216,82 @@ class VLABenchEnv(gym.Env):
         obs = self._get_wrapped_observation()
         info = self._get_info(success=success, ik_success=ik_success)
         self.last_info = info
-        return obs, reward, terminated, truncated, info
+        return self._format_obs(obs), reward, terminated, truncated, info
+
+    def _normalize_chunk_actions(self, chunk_actions) -> np.ndarray:
+        if isinstance(chunk_actions, torch.Tensor):
+            chunk_actions = chunk_actions.detach().cpu().numpy()
+        actions = np.asarray(chunk_actions, dtype=np.float32)
+        if actions.shape == (7,):
+            actions = actions.reshape(1, 1, 7)
+        elif actions.shape == (1, 7):
+            actions = actions.reshape(1, 1, 7)
+        elif actions.ndim == 2 and actions.shape[-1] == 7:
+            actions = actions.reshape(1, actions.shape[0], 7)
+        elif actions.ndim == 3 and actions.shape[0] == 1 and actions.shape[-1] == 7:
+            pass
+        else:
+            raise ValueError(
+                "VLABenchEnv.chunk_step expects [7], [1, 7], [T, 7], or [1, T, 7], "
+                f"got {actions.shape}"
+            )
+        return np.nan_to_num(actions, nan=0.0, posinf=0.0, neginf=0.0).astype(
+            np.float32,
+            copy=False,
+        )
+
+    def chunk_step(self, chunk_actions):
+        actions = self._normalize_chunk_actions(chunk_actions)
+        if actions.shape[0] != 1:
+            raise NotImplementedError("VLABenchEnv MVP only supports num_envs=1")
+
+        chunk_size = actions.shape[1]
+        obs_list = []
+        infos_list = []
+        rewards = []
+        terminations = []
+        truncations = []
+
+        stopped = False
+        last_obs = None
+        last_info = None
+        last_terminated = False
+        last_truncated = False
+
+        for step_idx in range(chunk_size):
+            if not stopped:
+                obs, reward, terminated, truncated, info = self.step(actions[0, step_idx])
+                last_obs = obs
+                last_info = info
+                last_terminated = bool(terminated)
+                last_truncated = bool(truncated)
+                stopped = last_terminated or last_truncated
+            else:
+                obs = last_obs
+                reward = 0.0
+                terminated = last_terminated
+                truncated = last_truncated
+                info = last_info
+
+            obs_list.append(obs)
+            infos_list.append(info)
+            rewards.append(torch.tensor([reward], dtype=torch.float32))
+            terminations.append(torch.tensor([terminated], dtype=torch.bool))
+            truncations.append(torch.tensor([truncated], dtype=torch.bool))
+
+        chunk_rewards = torch.stack(rewards, dim=1)
+        chunk_terminations = torch.stack(terminations, dim=1)
+        chunk_truncations = torch.stack(truncations, dim=1)
+        return (
+            obs_list,
+            chunk_rewards,
+            chunk_terminations,
+            chunk_truncations,
+            infos_list,
+        )
+
+    def update_reset_state_ids(self):
+        return None
 
     def render(self, info=None, rew=None):
         return self.env.render(

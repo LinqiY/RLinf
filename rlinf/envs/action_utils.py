@@ -278,6 +278,8 @@ def prepare_actions_for_vlabench(
     del model_type, action_dim
     if control_mode not in (None, "ee"):
         raise NotImplementedError("VLABench MVP only supports control_mode='ee'")
+    if isinstance(raw_chunk_actions, torch.Tensor):
+        raw_chunk_actions = raw_chunk_actions.detach().cpu().numpy()
     chunk_actions = np.asarray(raw_chunk_actions, dtype=np.float32)
     if chunk_actions.shape[-1] < 7:
         raise ValueError(
