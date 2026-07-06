@@ -97,6 +97,11 @@ class VLABenchEnv(gym.Env):
         self.last_raw_obs = None
         self.last_obs = None
         self.last_info = None
+        self._episode_done = False
+        self._last_done_obs = None
+        self._last_done_info = None
+        self._last_done_termination = False
+        self._last_done_truncation = False
 
         ncam = int(self.env.physics.model.ncam)
         extra_cams = max(ncam - 1, 0) if bool(get_cfg_value(cfg, "use_extra_views", True)) else 0
@@ -188,6 +193,11 @@ class VLABenchEnv(gym.Env):
         self.elapsed_steps = 0
         self.episode_return = 0.0
         self.success_once = False
+        self._episode_done = False
+        self._last_done_obs = None
+        self._last_done_info = None
+        self._last_done_termination = False
+        self._last_done_truncation = False
 
         obs = self._get_wrapped_observation()
         info = self._get_info(success=False, ik_success=None)
@@ -195,6 +205,17 @@ class VLABenchEnv(gym.Env):
         return self._format_obs(obs), info
 
     def step(self, action):
+        if self._episode_done:
+            if self._last_done_obs is None or self._last_done_info is None:
+                raise RuntimeError("VLABenchEnv is done but terminal observation is missing")
+            return (
+                self._last_done_obs,
+                0.0,
+                self._last_done_termination,
+                self._last_done_truncation,
+                self._last_done_info,
+            )
+
         ctrl_action, ik_success = ee_action_to_ctrl(
             self.env,
             action,
@@ -214,9 +235,16 @@ class VLABenchEnv(gym.Env):
         truncated = bool(self.elapsed_steps >= self.max_episode_steps)
 
         obs = self._get_wrapped_observation()
+        formatted_obs = self._format_obs(obs)
         info = self._get_info(success=success, ik_success=ik_success)
         self.last_info = info
-        return self._format_obs(obs), reward, terminated, truncated, info
+        if terminated or truncated:
+            self._episode_done = True
+            self._last_done_obs = formatted_obs
+            self._last_done_info = info
+            self._last_done_termination = terminated
+            self._last_done_truncation = truncated
+        return formatted_obs, reward, terminated, truncated, info
 
     def _normalize_chunk_actions(self, chunk_actions) -> np.ndarray:
         if isinstance(chunk_actions, torch.Tensor):
@@ -260,6 +288,7 @@ class VLABenchEnv(gym.Env):
 
         for step_idx in range(chunk_size):
             if not stopped:
+                assert actions.dtype == np.float32
                 obs, reward, terminated, truncated, info = self.step(actions[0, step_idx])
                 last_obs = obs
                 last_info = info

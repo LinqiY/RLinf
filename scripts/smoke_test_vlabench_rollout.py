@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 
 
@@ -76,6 +77,29 @@ def assert_obs(obs):
     assert obs["states"].shape == (1, 7)
     assert obs["states"].dtype == torch.float32
     assert isinstance(obs["task_descriptions"], list)
+    assert all(isinstance(item, str) for item in obs["task_descriptions"])
+
+
+def assert_info(info):
+    assert "success" in info
+    assert "success_once" in info
+    assert "elapsed_steps" in info
+    assert "ik_success" in info
+
+
+def make_action_cases():
+    base = np.zeros((2, 7), dtype=np.float32)
+    base[:, 2] = 0.05
+    return [
+        ("np [7]", base[0].copy(), (1, 1)),
+        ("np [1, 7]", base[:1].copy(), (1, 1)),
+        ("np [T, 7]", base.copy(), (1, 2)),
+        ("np [1, T, 7]", base[None].copy(), (1, 2)),
+        ("torch [7]", torch.as_tensor(base[0].copy()), (1, 1)),
+        ("torch [1, 7]", torch.as_tensor(base[:1].copy()), (1, 1)),
+        ("torch [T, 7]", torch.as_tensor(base.copy()), (1, 2)),
+        ("torch [1, T, 7]", torch.as_tensor(base[None].copy()), (1, 2)),
+    ]
 
 
 def main():
@@ -105,7 +129,38 @@ def main():
         ).to_dict()
         assert_obs(bootstrap["obs"])
 
-        print("[3] prepare_actions -> VLABench chunk shape")
+        print("[3] chunk_step action shape coverage")
+        for case_name, raw_actions, expected_shape in make_action_cases():
+            env.reset()
+            normalized = env._normalize_chunk_actions(raw_actions)
+            assert normalized.dtype == np.float32
+            assert normalized.shape == (1, expected_shape[1], 7)
+            if isinstance(raw_actions, torch.Tensor):
+                prepared = prepare_actions(
+                    raw_chunk_actions=raw_actions.reshape(1, expected_shape[1], 7),
+                    env_type=cfg.env_type,
+                    model_type="mlp_policy",
+                    num_action_chunks=expected_shape[1],
+                    action_dim=7,
+                )
+                assert prepared.dtype == np.float32
+            obs_list, rewards, terminations, truncations, infos_list = env.chunk_step(
+                raw_actions
+            )
+            assert len(obs_list) == expected_shape[1]
+            assert len(infos_list) == expected_shape[1]
+            assert rewards.shape == expected_shape
+            assert terminations.shape == expected_shape
+            assert truncations.shape == expected_shape
+            assert rewards.dtype == torch.float32
+            assert terminations.dtype == torch.bool
+            assert truncations.dtype == torch.bool
+            assert_obs(obs_list[-1])
+            assert_info(infos_list[-1])
+            print(case_name, "ok", rewards.shape, infos_list[-1]["elapsed_steps"])
+
+        print("[4] EnvWorker-style chunk_step + EnvOutput")
+        env.reset()
         raw_actions = torch.zeros((1, 3, 7), dtype=torch.float32)
         raw_actions[0, :, 2] = 0.05
         chunk_actions = prepare_actions(
@@ -116,8 +171,6 @@ def main():
             action_dim=7,
         )
         assert chunk_actions.shape == (1, 3, 7)
-
-        print("[4] EnvWorker-style chunk_step")
         obs_list, rewards, terminations, truncations, infos_list = env.chunk_step(
             chunk_actions
         )
@@ -126,9 +179,7 @@ def main():
         assert rewards.shape == (1, 3)
         assert terminations.shape == (1, 3)
         assert truncations.shape == (1, 3)
-        assert "success" in infos_list[-1]
-        assert "ik_success" in infos_list[-1]
-        assert "elapsed_steps" in infos_list[-1]
+        assert_info(infos_list[-1])
         print("chunk rewards:", rewards)
         print("chunk terminations:", terminations)
         print("chunk truncations:", truncations)
@@ -145,7 +196,7 @@ def main():
         assert_obs(env_output["obs"])
         assert env_output["rewards"].shape == (1, 3)
 
-        print("[5] max_episode_steps=5 termination by truncation")
+        print("[5] max_episode_steps=5 truncation latch")
         next_actions = torch.zeros((1, 3, 7), dtype=torch.float32)
         _, rewards2, terminations2, truncations2, infos2 = env.chunk_step(next_actions)
         assert rewards2.shape == (1, 3)
@@ -153,12 +204,45 @@ def main():
         assert truncations2.shape == (1, 3)
         assert truncations2.any().item()
         assert infos2[-1]["elapsed_steps"] == 5
+        elapsed_before = infos2[-1]["elapsed_steps"]
+        _, rewards3, terminations3, truncations3, infos3 = env.chunk_step(
+            torch.zeros((1, 2, 7), dtype=torch.float32)
+        )
+        assert rewards3.shape == (1, 2)
+        assert rewards3.sum().item() == 0.0
+        assert truncations3.all().item()
+        assert infos3[-1]["elapsed_steps"] == elapsed_before
+        assert_info(infos3[-1])
         print("second chunk rewards:", rewards2)
         print("second chunk terminations:", terminations2)
         print("second chunk truncations:", truncations2)
-        print("final info:", infos2[-1])
+        print("latched truncations:", truncations3)
+        print("final info:", infos3[-1])
 
-        print("[6] EnvWorker finish_rollout no-op hook")
+        print("[6] success termination latch")
+        env.reset()
+        original_should_terminate = env.env.task.should_terminate_episode
+        env.env.task.should_terminate_episode = lambda physics: True
+        try:
+            _, rewards4, terminations4, truncations4, infos4 = env.chunk_step(
+                torch.zeros((1, 2, 7), dtype=torch.float32)
+            )
+            assert rewards4.shape == (1, 2)
+            assert terminations4.all().item()
+            assert not truncations4.any().item()
+            assert rewards4[0, 0].item() == 1.0
+            assert rewards4[0, 1].item() == 0.0
+            assert infos4[-1]["success"] is True
+            assert infos4[-1]["success_once"] is True
+            assert infos4[-1]["episode_return"] == 1.0
+            assert_info(infos4[-1])
+            print("success rewards:", rewards4)
+            print("success terminations:", terminations4)
+            print("success info:", infos4[-1])
+        finally:
+            env.env.task.should_terminate_episode = original_should_terminate
+
+        print("[7] EnvWorker finish_rollout no-op hook")
         env.update_reset_state_ids()
     finally:
         env.close()
