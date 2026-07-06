@@ -1061,6 +1061,33 @@ def validate_embodied_cfg(cfg):
                 assert cfg.env.train.base_config_name == "r1pro_behavior", (
                     f"Only r1pro_behavior is supported for omnigibson, got {cfg.env.train.base_config_name}"
                 )
+
+        def validate_vlabench_mvp_env_cfg(env_cfg):
+            assert env_cfg.env_type == "vlabench"
+            assert env_cfg.get("task_name", None), "VLABench MVP requires task_name"
+            assert env_cfg.get("control_mode", "ee") == "ee", (
+                "VLABench MVP only supports control_mode='ee'"
+            )
+            assert env_cfg.get("action_mode", "absolute_ee") == "absolute_ee", (
+                "VLABench MVP only supports action_mode='absolute_ee'"
+            )
+            assert env_cfg.get("reward_mode", "success") == "success", (
+                "VLABench MVP only supports reward_mode='success'"
+            )
+            assert len(env_cfg.get("ee_frame_offset", [])) == 3, (
+                "VLABench MVP requires ee_frame_offset with 3 values"
+            )
+            assert int(env_cfg.get("max_episode_steps", 0)) > 0, (
+                "VLABench MVP requires max_episode_steps > 0"
+            )
+            assert not bool(env_cfg.get("require_pcd", False)), (
+                "VLABench MVP requires require_pcd=false"
+            )
+
+        if train_env_type == SupportedEnvType.VLABENCH and cfg.env.get("train", None) is not None:
+            validate_vlabench_mvp_env_cfg(cfg.env.train)
+        if eval_env_type == SupportedEnvType.VLABENCH and cfg.env.get("eval", None) is not None:
+            validate_vlabench_mvp_env_cfg(cfg.env.eval)
     return cfg
 
 

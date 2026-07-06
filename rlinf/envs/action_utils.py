@@ -263,6 +263,32 @@ def prepare_actions_for_roboverse(
     return chunk_actions
 
 
+def prepare_actions_for_vlabench(
+    raw_chunk_actions,
+    model_type,
+    action_dim,
+    control_mode="ee",
+) -> np.ndarray:
+    """Prepare VLABench MVP actions without touching env physics.
+
+    The VLABench wrapper performs EE-to-qpos IK inside env.step(), where
+    the dm_control physics object is available. This function only converts
+    tensors to finite float32 numpy arrays and keeps the first 7 EE dims.
+    """
+    del model_type, action_dim
+    if control_mode not in (None, "ee"):
+        raise NotImplementedError("VLABench MVP only supports control_mode='ee'")
+    chunk_actions = np.asarray(raw_chunk_actions, dtype=np.float32)
+    if chunk_actions.shape[-1] < 7:
+        raise ValueError(
+            f"VLABench EE actions require at least 7 dims, got shape {chunk_actions.shape}"
+        )
+    chunk_actions = chunk_actions[..., :7].copy()
+    return np.nan_to_num(chunk_actions, nan=0.0, posinf=0.0, neginf=0.0).astype(
+        np.float32, copy=False
+    )
+
+
 def prepare_actions(
     raw_chunk_actions,
     env_type: str,
@@ -359,6 +385,13 @@ def prepare_actions(
         chunk_actions = prepare_actions_for_polaris(
             raw_chunk_actions=raw_chunk_actions,
             model_type=model_type,
+        )
+    elif env_type == SupportedEnvType.VLABENCH:
+        chunk_actions = prepare_actions_for_vlabench(
+            raw_chunk_actions=raw_chunk_actions,
+            model_type=model_type,
+            action_dim=action_dim,
+            control_mode="ee",
         )
     else:
         chunk_actions = raw_chunk_actions
