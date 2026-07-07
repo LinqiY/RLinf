@@ -269,6 +269,7 @@ def prepare_actions_for_vlabench(
     action_dim,
     control_mode="ee",
     action_mode="absolute_ee",
+    joint_action_dim=None,
 ) -> np.ndarray:
     """Prepare VLABench MVP actions without touching env physics.
 
@@ -277,18 +278,31 @@ def prepare_actions_for_vlabench(
     tensors to finite float32 numpy arrays and keeps the first 7 EE dims.
     """
     del model_type, action_dim
-    if control_mode not in (None, "ee"):
-        raise NotImplementedError("VLABench only supports control_mode='ee'")
-    if action_mode not in (None, "absolute_ee", "delta_ee"):
-        raise NotImplementedError("VLABench only supports action_mode='absolute_ee' or 'delta_ee'")
+    valid_pairs = {
+        (None, None),
+        (None, "absolute_ee"),
+        ("ee", "absolute_ee"),
+        ("ee", "delta_ee"),
+        ("joint", "absolute_joint"),
+    }
+    if (control_mode, action_mode) not in valid_pairs:
+        raise NotImplementedError(
+            "VLABench supports (control_mode, action_mode): "
+            "('ee', 'absolute_ee'), ('ee', 'delta_ee'), ('joint', 'absolute_joint')"
+        )
     if isinstance(raw_chunk_actions, torch.Tensor):
         raw_chunk_actions = raw_chunk_actions.detach().cpu().numpy()
     chunk_actions = np.asarray(raw_chunk_actions, dtype=np.float32)
-    if chunk_actions.shape[-1] < 7:
+    expected_dim = 7
+    if control_mode == "joint":
+        expected_dim = int(joint_action_dim or action_dim)
+        if expected_dim <= 0:
+            raise ValueError("VLABench joint control requires a positive joint_action_dim/action_dim")
+    if chunk_actions.shape[-1] < expected_dim:
         raise ValueError(
-            f"VLABench EE actions require at least 7 dims, got shape {chunk_actions.shape}"
+            f"VLABench actions require at least {expected_dim} dims, got shape {chunk_actions.shape}"
         )
-    chunk_actions = chunk_actions[..., :7].copy()
+    chunk_actions = chunk_actions[..., :expected_dim].copy()
     return np.nan_to_num(chunk_actions, nan=0.0, posinf=0.0, neginf=0.0).astype(
         np.float32, copy=False
     )
@@ -305,6 +319,7 @@ def prepare_actions(
     wm_env_type=None,
     control_mode=None,
     action_mode=None,
+    joint_action_dim=None,
 ) -> torch.Tensor | np.ndarray:
     if isinstance(raw_chunk_actions, torch.Tensor):
         raw_chunk_actions = raw_chunk_actions.detach().cpu().contiguous()
@@ -400,6 +415,7 @@ def prepare_actions(
             action_dim=action_dim,
             control_mode=control_mode or "ee",
             action_mode=action_mode or "absolute_ee",
+            joint_action_dim=joint_action_dim,
         )
     else:
         chunk_actions = raw_chunk_actions

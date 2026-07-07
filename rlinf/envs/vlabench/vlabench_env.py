@@ -22,11 +22,13 @@ except ImportError:  # pragma: no cover - legacy fallback
 
 from rlinf.envs.vlabench.utils import (
     DEFAULT_EE_FRAME_OFFSET,
+    cfg_to_container,
     ee_action_to_ctrl,
     ensure_vlabench_importable,
-    cfg_to_container,
     get_cfg_value,
     get_episode_candidates,
+    get_joint_control_dims,
+    joint_action_to_ctrl,
     load_episode_configs,
     normalize_task_names,
     validate_mvp_config,
@@ -99,8 +101,8 @@ class VLABenchEnv(gym.Env):
 
     Supported scope:
     - sync/subprocess num_envs >= 1
-    - control_mode == "ee"
-    - action_mode in {"absolute_ee", "delta_ee"}
+    - control_mode in {"ee", "joint"}
+    - action_mode in {"absolute_ee", "delta_ee", "absolute_joint"}
     - reward_mode == "success"
     """
 
@@ -152,6 +154,7 @@ class VLABenchEnv(gym.Env):
         self.max_episode_steps = int(get_cfg_value(cfg, "max_episode_steps", 80))
         self.require_pcd = bool(get_cfg_value(cfg, "require_pcd", False))
         self.return_tensors = bool(get_cfg_value(cfg, "return_tensors", False))
+        self.control_mode = get_cfg_value(cfg, "control_mode", "ee")
         self.action_mode = get_cfg_value(cfg, "action_mode", "absolute_ee")
         self.ee_frame_offset = np.asarray(
             get_cfg_value(cfg, "ee_frame_offset", DEFAULT_EE_FRAME_OFFSET),
@@ -161,6 +164,9 @@ class VLABenchEnv(gym.Env):
         self.delta_rotation_scale = float(get_cfg_value(cfg, "delta_rotation_scale", 1.0))
         self.delta_position_clip = float(get_cfg_value(cfg, "delta_position_clip", 0.05))
         self.delta_rotation_clip = float(get_cfg_value(cfg, "delta_rotation_clip", 0.25))
+        self.joint_action_dim = get_cfg_value(cfg, "joint_action_dim", None)
+        self.joint_position_low = get_cfg_value(cfg, "joint_position_low", None)
+        self.joint_position_high = get_cfg_value(cfg, "joint_position_high", None)
         self.gripper_open_threshold = float(get_cfg_value(cfg, "gripper_open_threshold", 0.1))
         self.gripper_open_value = float(get_cfg_value(cfg, "gripper_open_value", 0.04))
         self.render_height = int(get_cfg_value(cfg, "render_height", 256))
@@ -205,7 +211,8 @@ class VLABenchEnv(gym.Env):
 
         ncam = int(self.envs[0].physics.model.ncam)
         extra_cams = max(ncam - 1, 0) if bool(get_cfg_value(cfg, "use_extra_views", True)) else 0
-        action_shape = (7,) if self.num_envs == 1 else (self.num_envs, 7)
+        self.policy_action_dim = self._infer_policy_action_dim(self.envs[0])
+        action_shape = (self.policy_action_dim,) if self.num_envs == 1 else (self.num_envs, self.policy_action_dim)
         self.action_space = gym.spaces.Box(
             low=-np.inf,
             high=np.inf,
@@ -487,7 +494,14 @@ class VLABenchEnv(gym.Env):
             self._subproc_remotes.append(parent_remote)
             self._subproc_processes.append(process)
 
-        action_shape = (7,) if self.num_envs == 1 else (self.num_envs, 7)
+        if self.control_mode == "joint" and self.joint_action_dim is None:
+            raise ValueError(
+                "VLABenchEnv subprocess vector_mode with control_mode='joint' requires an "
+                "explicit joint_action_dim in config (parent process cannot query worker "
+                "qpos_dim before the first reset). Set joint_action_dim=qpos_dim+1 explicitly."
+            )
+        self.policy_action_dim = int(self.joint_action_dim or 7)
+        action_shape = (self.policy_action_dim,) if self.num_envs == 1 else (self.num_envs, self.policy_action_dim)
         self.action_space = gym.spaces.Box(
             low=-np.inf,
             high=np.inf,
@@ -517,6 +531,20 @@ class VLABenchEnv(gym.Env):
                 "task_descriptions": gym.spaces.Sequence(gym.spaces.Text(max_length=1024)),
             }
         )
+
+    def _infer_policy_action_dim(self, env) -> int:
+        if self.control_mode == "joint":
+            qpos_dim, _, _ = get_joint_control_dims(env)
+            inferred = qpos_dim + 1
+            if self.joint_action_dim is not None and int(self.joint_action_dim) != inferred:
+                raise ValueError(
+                    f"Configured joint_action_dim={self.joint_action_dim} does not match "
+                    f"VLABench policy joint dim {inferred}"
+                )
+            self.joint_action_dim = inferred
+            return inferred
+        return 7
+
 
     def _assert_subprocess_alive(self, env_idx: int) -> None:
         process = self._subproc_processes[env_idx]
@@ -942,18 +970,28 @@ class VLABenchEnv(gym.Env):
                 self._last_done_info[env_idx],
             )
 
-        ctrl_action, ik_success = ee_action_to_ctrl(
-            self.envs[env_idx],
-            action,
-            ee_frame_offset=self.ee_frame_offset,
-            gripper_open_threshold=self.gripper_open_threshold,
-            gripper_open_value=self.gripper_open_value,
-            action_mode=self.action_mode,
-            delta_position_scale=self.delta_position_scale,
-            delta_rotation_scale=self.delta_rotation_scale,
-            delta_position_clip=self.delta_position_clip,
-            delta_rotation_clip=self.delta_rotation_clip,
-        )
+        if self.control_mode == "joint":
+            ctrl_action, ik_success = joint_action_to_ctrl(
+                self.envs[env_idx],
+                action,
+                gripper_open_threshold=self.gripper_open_threshold,
+                gripper_open_value=self.gripper_open_value,
+                joint_position_low=self.joint_position_low,
+                joint_position_high=self.joint_position_high,
+            )
+        else:
+            ctrl_action, ik_success = ee_action_to_ctrl(
+                self.envs[env_idx],
+                action,
+                ee_frame_offset=self.ee_frame_offset,
+                gripper_open_threshold=self.gripper_open_threshold,
+                gripper_open_value=self.gripper_open_value,
+                action_mode=self.action_mode,
+                delta_position_scale=self.delta_position_scale,
+                delta_rotation_scale=self.delta_rotation_scale,
+                delta_position_clip=self.delta_position_clip,
+                delta_rotation_clip=self.delta_rotation_clip,
+            )
         self.envs[env_idx].step(ctrl_action)
         self.elapsed_steps[env_idx] += 1
 
@@ -988,18 +1026,19 @@ class VLABenchEnv(gym.Env):
         if isinstance(action, torch.Tensor):
             action = action.detach().cpu().numpy()
         actions = np.asarray(action, dtype=np.float32)
-        input_was_single = actions.shape == (7,)
+        action_dim = int(self.policy_action_dim)
+        input_was_single = actions.shape == (action_dim,)
         if self.num_envs == 1:
-            if actions.shape == (7,):
-                actions = actions.reshape(1, 7)
-            elif actions.shape == (1, 7):
+            if actions.shape == (action_dim,):
+                actions = actions.reshape(1, action_dim)
+            elif actions.shape == (1, action_dim):
                 pass
             else:
-                raise ValueError(f"VLABenchEnv.step expects [7] or [1, 7], got {actions.shape}")
+                raise ValueError(f"VLABenchEnv.step expects [{action_dim}] or [1, {action_dim}], got {actions.shape}")
         else:
-            if actions.shape != (self.num_envs, 7):
+            if actions.shape != (self.num_envs, action_dim):
                 raise ValueError(
-                    f"VLABenchEnv.step expects [B, 7] for B={self.num_envs}, got {actions.shape}"
+                    f"VLABenchEnv.step expects [B, {action_dim}] for B={self.num_envs}, got {actions.shape}"
                 )
         actions = np.nan_to_num(actions, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
         return actions, input_was_single
@@ -1038,29 +1077,30 @@ class VLABenchEnv(gym.Env):
         if isinstance(chunk_actions, torch.Tensor):
             chunk_actions = chunk_actions.detach().cpu().numpy()
         actions = np.asarray(chunk_actions, dtype=np.float32)
+        action_dim = int(self.policy_action_dim)
         if self.num_envs == 1:
-            if actions.shape == (7,):
-                actions = actions.reshape(1, 1, 7)
-            elif actions.shape == (1, 7):
-                actions = actions.reshape(1, 1, 7)
-            elif actions.ndim == 2 and actions.shape[-1] == 7:
-                actions = actions.reshape(1, actions.shape[0], 7)
-            elif actions.ndim == 3 and actions.shape[0] == 1 and actions.shape[-1] == 7:
+            if actions.shape == (action_dim,):
+                actions = actions.reshape(1, 1, action_dim)
+            elif actions.shape == (1, action_dim):
+                actions = actions.reshape(1, 1, action_dim)
+            elif actions.ndim == 2 and actions.shape[-1] == action_dim:
+                actions = actions.reshape(1, actions.shape[0], action_dim)
+            elif actions.ndim == 3 and actions.shape[0] == 1 and actions.shape[-1] == action_dim:
                 pass
             else:
                 raise ValueError(
-                    "VLABenchEnv.chunk_step expects [7], [1, 7], [T, 7], or [1, T, 7] "
-                    f"for num_envs=1, got {actions.shape}"
+                    f"VLABenchEnv.chunk_step expects [{action_dim}], [1, {action_dim}], "
+                    f"[T, {action_dim}], or [1, T, {action_dim}] for num_envs=1, got {actions.shape}"
                 )
         else:
-            if actions.ndim == 2 and actions.shape == (self.num_envs, 7):
-                actions = actions.reshape(self.num_envs, 1, 7)
-            elif actions.ndim == 3 and actions.shape[0] == self.num_envs and actions.shape[-1] == 7:
+            if actions.ndim == 2 and actions.shape == (self.num_envs, action_dim):
+                actions = actions.reshape(self.num_envs, 1, action_dim)
+            elif actions.ndim == 3 and actions.shape[0] == self.num_envs and actions.shape[-1] == action_dim:
                 pass
             else:
                 raise ValueError(
-                    f"VLABenchEnv.chunk_step expects [B, 7] or [B, T, 7] for B={self.num_envs}, "
-                    f"got {actions.shape}"
+                    f"VLABenchEnv.chunk_step expects [B, {action_dim}] or [B, T, {action_dim}] "
+                    f"for B={self.num_envs}, got {actions.shape}"
                 )
         return np.nan_to_num(actions, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
 

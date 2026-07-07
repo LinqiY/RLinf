@@ -1094,12 +1094,16 @@ def validate_embodied_cfg(cfg):
                 assert eval_cfg.get("export_format", "jsonl") == "jsonl", (
                     "VLABench eval export currently supports export_format='jsonl'"
                 )
-            assert env_cfg.get("control_mode", "ee") == "ee", (
-                "VLABench MVP only supports control_mode='ee'"
-            )
+            control_mode = env_cfg.get("control_mode", "ee")
             action_mode = env_cfg.get("action_mode", "absolute_ee")
-            assert action_mode in ["absolute_ee", "delta_ee"], (
-                "VLABench only supports action_mode='absolute_ee' or 'delta_ee'"
+            valid_pairs = [
+                ("ee", "absolute_ee"),
+                ("ee", "delta_ee"),
+                ("joint", "absolute_joint"),
+            ]
+            assert (control_mode, action_mode) in valid_pairs, (
+                "VLABench supports (control_mode, action_mode): "
+                "('ee', 'absolute_ee'), ('ee', 'delta_ee'), ('joint', 'absolute_joint')"
             )
             if action_mode == "delta_ee":
                 assert float(env_cfg.get("delta_position_clip", 0.05)) > 0, (
@@ -1108,6 +1112,25 @@ def validate_embodied_cfg(cfg):
                 assert float(env_cfg.get("delta_rotation_clip", 0.25)) > 0, (
                     "VLABench delta_ee requires delta_rotation_clip > 0"
                 )
+            if control_mode == "joint":
+                if env_cfg.get("joint_action_dim", None) is not None:
+                    assert int(env_cfg.get("joint_action_dim")) > 0, (
+                        "VLABench joint control requires joint_action_dim > 0 when provided"
+                    )
+                if env_cfg.get("vector_mode", "sync") == "subprocess":
+                    assert env_cfg.get("joint_action_dim", None) is not None, (
+                        "VLABench joint control with vector_mode='subprocess' requires an "
+                        "explicit joint_action_dim (parent cannot query worker qpos_dim before reset)"
+                    )
+                low = env_cfg.get("joint_position_low", None)
+                high = env_cfg.get("joint_position_high", None)
+                assert (low is None) == (high is None), (
+                    "VLABench joint_position_low/high must be provided together"
+                )
+                if low is not None:
+                    assert len(low) == len(high), (
+                        "VLABench joint_position_low/high must have the same length"
+                    )
             assert env_cfg.get("reward_mode", "success") == "success", (
                 "VLABench MVP only supports reward_mode='success'"
             )

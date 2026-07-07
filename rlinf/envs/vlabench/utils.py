@@ -62,17 +62,37 @@ def validate_mvp_config(cfg: Any) -> None:
         raise ValueError("VLABench episode_config_sample_mode must be 'random' or 'sequential'")
 
     control_mode = get_cfg_value(cfg, "control_mode", "ee")
-    if control_mode != "ee":
-        raise NotImplementedError("VLABenchEnv MVP only supports control_mode='ee'")
-
     action_mode = get_cfg_value(cfg, "action_mode", "absolute_ee")
-    if action_mode not in ("absolute_ee", "delta_ee"):
-        raise NotImplementedError("VLABenchEnv only supports action_mode='absolute_ee' or 'delta_ee'")
+    valid_pairs = {
+        ("ee", "absolute_ee"),
+        ("ee", "delta_ee"),
+        ("joint", "absolute_joint"),
+    }
+    if (control_mode, action_mode) not in valid_pairs:
+        raise NotImplementedError(
+            "VLABenchEnv supports (control_mode, action_mode) pairs: "
+            "('ee', 'absolute_ee'), ('ee', 'delta_ee'), ('joint', 'absolute_joint')"
+        )
     if action_mode == "delta_ee":
         if float(get_cfg_value(cfg, "delta_position_clip", 0.05)) <= 0:
             raise ValueError("delta_position_clip must be > 0 for action_mode='delta_ee'")
         if float(get_cfg_value(cfg, "delta_rotation_clip", 0.25)) <= 0:
             raise ValueError("delta_rotation_clip must be > 0 for action_mode='delta_ee'")
+    if action_mode == "absolute_joint":
+        low = cfg_to_container(get_cfg_value(cfg, "joint_position_low", None))
+        high = cfg_to_container(get_cfg_value(cfg, "joint_position_high", None))
+        if (low is None) != (high is None):
+            raise ValueError("joint_position_low and joint_position_high must be provided together")
+        if low is not None and len(low) != len(high):
+            raise ValueError("joint_position_low and joint_position_high must have the same length")
+        resolved_vector_mode = get_cfg_value(cfg, "vector_mode", None)
+        if resolved_vector_mode is None:
+            resolved_vector_mode = "subprocess" if bool(get_cfg_value(cfg, "use_subprocess_env", False)) else "sync"
+        if resolved_vector_mode == "subprocess" and get_cfg_value(cfg, "joint_action_dim", None) is None:
+            raise ValueError(
+                "VLABenchEnv joint control with vector_mode='subprocess' requires an explicit "
+                "joint_action_dim (parent cannot query worker qpos_dim before the first reset)"
+            )
 
     reward_mode = get_cfg_value(cfg, "reward_mode", "success")
     if reward_mode != "success":
@@ -193,16 +213,86 @@ def normalize_ee_action(action: np.ndarray) -> np.ndarray:
     return action.astype(np.float32, copy=False)
 
 
-def make_gripper_state(gripper: float, threshold: float, open_value: float) -> np.ndarray:
+def make_gripper_state(
+    gripper: float,
+    threshold: float,
+    open_value: float,
+    gripper_ctrl_dim: int = 2,
+) -> np.ndarray:
+    if gripper_ctrl_dim < 1:
+        raise ValueError(f"gripper_ctrl_dim must be >= 1, got {gripper_ctrl_dim}")
     if gripper >= threshold:
-        return np.ones(2, dtype=np.float32) * np.float32(open_value)
-    return np.zeros(2, dtype=np.float32)
+        return np.ones(gripper_ctrl_dim, dtype=np.float32) * np.float32(open_value)
+    return np.zeros(gripper_ctrl_dim, dtype=np.float32)
 
 
 def current_noop_ctrl(env, gripper_open_value: float) -> np.ndarray:
     qpos = np.asarray(env.robot.get_qpos(env.physics), dtype=np.float32)
     gripper = np.ones(2, dtype=np.float32) * np.float32(gripper_open_value)
     return np.concatenate([qpos, gripper]).astype(np.float32)
+
+
+def get_joint_control_dims(env) -> tuple[int, int, int]:
+    qpos_dim = int(np.asarray(env.robot.get_qpos(env.physics), dtype=np.float32).reshape(-1).shape[0])
+    ctrl_dim = int(env.physics.model.nu)
+    gripper_ctrl_dim = ctrl_dim - qpos_dim
+    if qpos_dim <= 0:
+        raise ValueError(f"VLABench joint qpos_dim must be > 0, got {qpos_dim}")
+    if ctrl_dim <= qpos_dim:
+        raise ValueError(f"VLABench ctrl_dim must be > qpos_dim, got ctrl_dim={ctrl_dim}, qpos_dim={qpos_dim}")
+    if gripper_ctrl_dim < 1:
+        raise ValueError(f"VLABench gripper_ctrl_dim must be >= 1, got {gripper_ctrl_dim}")
+    return qpos_dim, ctrl_dim, gripper_ctrl_dim
+
+
+def normalize_joint_action(action: np.ndarray, qpos_dim: int) -> np.ndarray:
+    action = np.asarray(action, dtype=np.float32)
+    expected_shape = (qpos_dim + 1,)
+    if action.shape == (1, qpos_dim + 1):
+        action = action[0]
+    if action.shape != expected_shape:
+        raise ValueError(
+            f"VLABench joint action must have shape {expected_shape} or (1, {qpos_dim + 1}), got {action.shape}"
+        )
+    if not np.all(np.isfinite(action)):
+        action = np.nan_to_num(action, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+    return action.astype(np.float32, copy=False)
+
+
+def joint_action_to_ctrl(
+    env,
+    action: np.ndarray,
+    *,
+    gripper_open_threshold: float,
+    gripper_open_value: float,
+    joint_position_low=None,
+    joint_position_high=None,
+) -> tuple[np.ndarray, bool]:
+    qpos_dim, ctrl_dim, gripper_ctrl_dim = get_joint_control_dims(env)
+    action = normalize_joint_action(action, qpos_dim)
+    joint_qpos = action[:qpos_dim].copy()
+    low = cfg_to_container(joint_position_low)
+    high = cfg_to_container(joint_position_high)
+    if low is not None or high is not None:
+        if low is None or high is None:
+            raise ValueError("joint_position_low and joint_position_high must be provided together")
+        low = np.asarray(low, dtype=np.float32).reshape(-1)
+        high = np.asarray(high, dtype=np.float32).reshape(-1)
+        if low.shape != (qpos_dim,) or high.shape != (qpos_dim,):
+            raise ValueError(
+                f"joint_position_low/high must have shape ({qpos_dim},), got {low.shape} and {high.shape}"
+            )
+        joint_qpos = np.clip(joint_qpos, low, high)
+    gripper_state = make_gripper_state(
+        float(action[-1]),
+        threshold=gripper_open_threshold,
+        open_value=gripper_open_value,
+        gripper_ctrl_dim=gripper_ctrl_dim,
+    )
+    ctrl_action = np.concatenate([joint_qpos, gripper_state]).astype(np.float32)
+    if ctrl_action.shape != (ctrl_dim,):
+        raise ValueError(f"VLABench joint ctrl must have shape ({ctrl_dim},), got {ctrl_action.shape}")
+    return ctrl_action, True
 
 
 def delta_ee_action_to_absolute(
@@ -268,6 +358,7 @@ def ee_action_to_ctrl(
         gripper,
         threshold=gripper_open_threshold,
         open_value=gripper_open_value,
+        gripper_ctrl_dim=2,
     )
 
     try:
