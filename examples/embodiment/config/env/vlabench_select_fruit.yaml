@@ -11,6 +11,11 @@ control_mode: ee
 action_mode: absolute_ee
 reward_mode: success
 
+delta_position_scale: 1.0
+delta_rotation_scale: 1.0
+delta_position_clip: 0.05
+delta_rotation_clip: 0.25
+
 ee_frame_offset: [0.0, -0.4, 0.78]
 gripper_open_threshold: 0.1
 gripper_open_value: 0.04

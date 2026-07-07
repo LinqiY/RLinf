@@ -97,10 +97,10 @@ def _vlabench_subprocess_worker(remote, parent_remote, worker_id: int):
 class VLABenchEnv(gym.Env):
     """Gym-style VLABench wrapper with sync vector-env support.
 
-    Supported Phase-2 scope:
-    - sync for-loop num_envs >= 1
+    Supported scope:
+    - sync/subprocess num_envs >= 1
     - control_mode == "ee"
-    - action_mode == "absolute_ee"
+    - action_mode in {"absolute_ee", "delta_ee"}
     - reward_mode == "success"
     """
 
@@ -152,10 +152,15 @@ class VLABenchEnv(gym.Env):
         self.max_episode_steps = int(get_cfg_value(cfg, "max_episode_steps", 80))
         self.require_pcd = bool(get_cfg_value(cfg, "require_pcd", False))
         self.return_tensors = bool(get_cfg_value(cfg, "return_tensors", False))
+        self.action_mode = get_cfg_value(cfg, "action_mode", "absolute_ee")
         self.ee_frame_offset = np.asarray(
             get_cfg_value(cfg, "ee_frame_offset", DEFAULT_EE_FRAME_OFFSET),
             dtype=np.float32,
         )
+        self.delta_position_scale = float(get_cfg_value(cfg, "delta_position_scale", 1.0))
+        self.delta_rotation_scale = float(get_cfg_value(cfg, "delta_rotation_scale", 1.0))
+        self.delta_position_clip = float(get_cfg_value(cfg, "delta_position_clip", 0.05))
+        self.delta_rotation_clip = float(get_cfg_value(cfg, "delta_rotation_clip", 0.25))
         self.gripper_open_threshold = float(get_cfg_value(cfg, "gripper_open_threshold", 0.1))
         self.gripper_open_value = float(get_cfg_value(cfg, "gripper_open_value", 0.04))
         self.render_height = int(get_cfg_value(cfg, "render_height", 256))
@@ -943,6 +948,11 @@ class VLABenchEnv(gym.Env):
             ee_frame_offset=self.ee_frame_offset,
             gripper_open_threshold=self.gripper_open_threshold,
             gripper_open_value=self.gripper_open_value,
+            action_mode=self.action_mode,
+            delta_position_scale=self.delta_position_scale,
+            delta_rotation_scale=self.delta_rotation_scale,
+            delta_position_clip=self.delta_position_clip,
+            delta_rotation_clip=self.delta_rotation_clip,
         )
         self.envs[env_idx].step(ctrl_action)
         self.elapsed_steps[env_idx] += 1

@@ -66,8 +66,13 @@ def validate_mvp_config(cfg: Any) -> None:
         raise NotImplementedError("VLABenchEnv MVP only supports control_mode='ee'")
 
     action_mode = get_cfg_value(cfg, "action_mode", "absolute_ee")
-    if action_mode != "absolute_ee":
-        raise NotImplementedError("VLABenchEnv MVP only supports action_mode='absolute_ee'")
+    if action_mode not in ("absolute_ee", "delta_ee"):
+        raise NotImplementedError("VLABenchEnv only supports action_mode='absolute_ee' or 'delta_ee'")
+    if action_mode == "delta_ee":
+        if float(get_cfg_value(cfg, "delta_position_clip", 0.05)) <= 0:
+            raise ValueError("delta_position_clip must be > 0 for action_mode='delta_ee'")
+        if float(get_cfg_value(cfg, "delta_rotation_clip", 0.25)) <= 0:
+            raise ValueError("delta_rotation_clip must be > 0 for action_mode='delta_ee'")
 
     reward_mode = get_cfg_value(cfg, "reward_mode", "success")
     if reward_mode != "success":
@@ -200,6 +205,31 @@ def current_noop_ctrl(env, gripper_open_value: float) -> np.ndarray:
     return np.concatenate([qpos, gripper]).astype(np.float32)
 
 
+def delta_ee_action_to_absolute(
+    env,
+    action: np.ndarray,
+    *,
+    ee_frame_offset,
+    delta_position_scale: float,
+    delta_rotation_scale: float,
+    delta_position_clip: float,
+    delta_rotation_clip: float,
+) -> np.ndarray:
+    action = normalize_ee_action(action)
+    raw_obs = env.get_observation(require_pcd=False)
+    current_state = ee_state_to_policy_state(raw_obs, ee_frame_offset)
+
+    delta_pos = action[:3] * np.float32(delta_position_scale)
+    delta_euler = action[3:6] * np.float32(delta_rotation_scale)
+    delta_pos = np.clip(delta_pos, -delta_position_clip, delta_position_clip)
+    delta_euler = np.clip(delta_euler, -delta_rotation_clip, delta_rotation_clip)
+
+    target_pos_local = current_state[:3] + delta_pos
+    target_euler = current_state[3:6] + delta_euler
+    gripper = np.asarray([action[6]], dtype=np.float32)
+    return np.concatenate([target_pos_local, target_euler, gripper]).astype(np.float32)
+
+
 def ee_action_to_ctrl(
     env,
     action: np.ndarray,
@@ -207,9 +237,26 @@ def ee_action_to_ctrl(
     ee_frame_offset,
     gripper_open_threshold: float,
     gripper_open_value: float,
+    action_mode: str = "absolute_ee",
+    delta_position_scale: float = 1.0,
+    delta_rotation_scale: float = 1.0,
+    delta_position_clip: float = 0.05,
+    delta_rotation_clip: float = 0.25,
 ) -> tuple[np.ndarray, bool]:
     """Convert OneTwoVLA-style 7D EE action to VLABench MuJoCo ctrl."""
     action = normalize_ee_action(action)
+    if action_mode == "delta_ee":
+        action = delta_ee_action_to_absolute(
+            env,
+            action,
+            ee_frame_offset=ee_frame_offset,
+            delta_position_scale=delta_position_scale,
+            delta_rotation_scale=delta_rotation_scale,
+            delta_position_clip=delta_position_clip,
+            delta_rotation_clip=delta_rotation_clip,
+        )
+    elif action_mode != "absolute_ee":
+        raise NotImplementedError("VLABenchEnv only supports action_mode='absolute_ee' or 'delta_ee'")
     target_pos = action[:3].copy() + np.asarray(ee_frame_offset, dtype=np.float32)
     target_euler = action[3:6].copy()
     gripper = float(action[6])

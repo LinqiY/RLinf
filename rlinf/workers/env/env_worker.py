@@ -448,6 +448,8 @@ class EnvWorker(Worker):
             action_dim=self.model_cfg.action_dim,
             policy=self.model_cfg.get("policy_setup", None),
             wm_env_type=self.cfg.env.train.get("wm_env_type", None),
+            control_mode=self.cfg.env.train.get("control_mode", None),
+            action_mode=self.cfg.env.train.get("action_mode", None),
         )
         if isinstance(chunk_actions, dict):
             chunk_actions["actions"] = exec_actions
@@ -536,6 +538,8 @@ class EnvWorker(Worker):
             action_dim=self.model_cfg.action_dim,
             policy=self.model_cfg.get("policy_setup", None),
             wm_env_type=self.cfg.env.eval.get("wm_env_type", None),
+            control_mode=self.cfg.env.eval.get("control_mode", None),
+            action_mode=self.cfg.env.eval.get("action_mode", None),
         )
         env_info = {}
 

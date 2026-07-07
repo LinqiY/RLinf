@@ -1097,9 +1097,17 @@ def validate_embodied_cfg(cfg):
             assert env_cfg.get("control_mode", "ee") == "ee", (
                 "VLABench MVP only supports control_mode='ee'"
             )
-            assert env_cfg.get("action_mode", "absolute_ee") == "absolute_ee", (
-                "VLABench MVP only supports action_mode='absolute_ee'"
+            action_mode = env_cfg.get("action_mode", "absolute_ee")
+            assert action_mode in ["absolute_ee", "delta_ee"], (
+                "VLABench only supports action_mode='absolute_ee' or 'delta_ee'"
             )
+            if action_mode == "delta_ee":
+                assert float(env_cfg.get("delta_position_clip", 0.05)) > 0, (
+                    "VLABench delta_ee requires delta_position_clip > 0"
+                )
+                assert float(env_cfg.get("delta_rotation_clip", 0.25)) > 0, (
+                    "VLABench delta_ee requires delta_rotation_clip > 0"
+                )
             assert env_cfg.get("reward_mode", "success") == "success", (
                 "VLABench MVP only supports reward_mode='success'"
             )

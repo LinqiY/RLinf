@@ -268,6 +268,7 @@ def prepare_actions_for_vlabench(
     model_type,
     action_dim,
     control_mode="ee",
+    action_mode="absolute_ee",
 ) -> np.ndarray:
     """Prepare VLABench MVP actions without touching env physics.
 
@@ -277,7 +278,9 @@ def prepare_actions_for_vlabench(
     """
     del model_type, action_dim
     if control_mode not in (None, "ee"):
-        raise NotImplementedError("VLABench MVP only supports control_mode='ee'")
+        raise NotImplementedError("VLABench only supports control_mode='ee'")
+    if action_mode not in (None, "absolute_ee", "delta_ee"):
+        raise NotImplementedError("VLABench only supports action_mode='absolute_ee' or 'delta_ee'")
     if isinstance(raw_chunk_actions, torch.Tensor):
         raw_chunk_actions = raw_chunk_actions.detach().cpu().numpy()
     chunk_actions = np.asarray(raw_chunk_actions, dtype=np.float32)
@@ -300,6 +303,8 @@ def prepare_actions(
     action_scale: float = 1.0,
     policy: str = "widowx_bridge",
     wm_env_type=None,
+    control_mode=None,
+    action_mode=None,
 ) -> torch.Tensor | np.ndarray:
     if isinstance(raw_chunk_actions, torch.Tensor):
         raw_chunk_actions = raw_chunk_actions.detach().cpu().contiguous()
@@ -393,7 +398,8 @@ def prepare_actions(
             raw_chunk_actions=raw_chunk_actions,
             model_type=model_type,
             action_dim=action_dim,
-            control_mode="ee",
+            control_mode=control_mode or "ee",
+            action_mode=action_mode or "absolute_ee",
         )
     else:
         chunk_actions = raw_chunk_actions
