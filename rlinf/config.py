@@ -1089,6 +1089,11 @@ def validate_embodied_cfg(cfg):
                 assert int(env_cfg.get("num_envs", env_cfg.get("total_num_envs", 1))) >= 1, (
                     "VLABench subprocess vector mode requires num_envs >= 1"
                 )
+            if env_cfg.get("vlabench_eval", None) is not None:
+                eval_cfg = env_cfg.vlabench_eval
+                assert eval_cfg.get("export_format", "jsonl") == "jsonl", (
+                    "VLABench eval export currently supports export_format='jsonl'"
+                )
             assert env_cfg.get("control_mode", "ee") == "ee", (
                 "VLABench MVP only supports control_mode='ee'"
             )

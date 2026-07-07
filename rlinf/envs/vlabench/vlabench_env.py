@@ -4,7 +4,10 @@
 
 from __future__ import annotations
 
+import csv
+import json
 import multiprocessing as mp
+import os
 import traceback
 from typing import Optional
 
@@ -161,6 +164,7 @@ class VLABenchEnv(gym.Env):
         self.reset_wait_step = int(get_cfg_value(cfg, "reset_wait_step", 10))
         self.random_init = bool(get_cfg_value(cfg, "random_init", True))
         self.eval_track = get_cfg_value(cfg, "eval_track", None)
+        self._init_eval_export()
 
         if self.vector_mode == "subprocess":
             self._init_subprocess_vector()
@@ -238,6 +242,210 @@ class VLABenchEnv(gym.Env):
     @property
     def total_num_group_envs(self):
         return self.num_envs
+
+    def _get_nested_cfg_value(self, section: str, key: str, default=None):
+        value = get_cfg_value(self.cfg, section, None)
+        if value is None:
+            return default
+        return get_cfg_value(value, key, default)
+
+    def _init_eval_export(self) -> None:
+        self.eval_export_enabled = bool(
+            self._get_nested_cfg_value("vlabench_eval", "export_results", False)
+        )
+        self.eval_export_format = self._get_nested_cfg_value(
+            "vlabench_eval", "export_format", "jsonl"
+        )
+        if self.eval_export_format != "jsonl":
+            raise NotImplementedError("VLABench eval export currently supports export_format='jsonl'")
+        default_result_path = os.path.join(".", "vlabench_results.jsonl")
+        self.eval_result_path = self._get_nested_cfg_value(
+            "vlabench_eval", "result_path", default_result_path
+        )
+        self.eval_summary_path = self._get_nested_cfg_value(
+            "vlabench_eval", "summary_path", None
+        )
+        self.eval_summary_csv_path = self._get_nested_cfg_value(
+            "vlabench_eval", "summary_csv_path", None
+        )
+        if self.eval_summary_path is None:
+            root, _ = os.path.splitext(str(self.eval_result_path))
+            self.eval_summary_path = f"{root}_summary.json"
+        if self.eval_summary_csv_path is None:
+            root, _ = os.path.splitext(str(self.eval_summary_path))
+            self.eval_summary_csv_path = f"{root}.csv"
+        self._episode_id_counter = 0
+        self._exported_done = np.zeros(self.num_envs, dtype=bool)
+        self._ik_attempts = np.zeros(self.num_envs, dtype=np.int32)
+        self._ik_failures = np.zeros(self.num_envs, dtype=np.int32)
+        self._episode_records = []
+        if self.eval_export_enabled:
+            result_dir = os.path.dirname(str(self.eval_result_path))
+            if result_dir:
+                os.makedirs(result_dir, exist_ok=True)
+            summary_dir = os.path.dirname(str(self.eval_summary_path))
+            if summary_dir:
+                os.makedirs(summary_dir, exist_ok=True)
+            csv_dir = os.path.dirname(str(self.eval_summary_csv_path))
+            if csv_dir:
+                os.makedirs(csv_dir, exist_ok=True)
+
+    def _to_jsonable(self, value):
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 1:
+                return value.item()
+            return value.detach().cpu().tolist()
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, (bool, int, float, str)) or value is None:
+            return value
+        return str(value)
+
+    def _as_scalar(self, value, env_idx: int = 0):
+        if isinstance(value, torch.Tensor):
+            if value.ndim == 0:
+                return value.item()
+            return value[env_idx].item()
+        if isinstance(value, np.ndarray):
+            if value.ndim == 0:
+                return value.item()
+            return value[env_idx].item()
+        if isinstance(value, (list, tuple)):
+            return value[env_idx]
+        return value
+
+    def _update_ik_stats(self, env_idx: int, ik_success) -> None:
+        if ik_success is None:
+            return
+        self._ik_attempts[env_idx] += 1
+        if not bool(ik_success):
+            self._ik_failures[env_idx] += 1
+
+    def _build_episode_record(self, env_idx: int, info: dict, final_reward: float) -> dict:
+        attempts = int(self._ik_attempts[env_idx])
+        failures = int(self._ik_failures[env_idx])
+        record = {
+            "episode_id": int(self._episode_id_counter),
+            "env_id": int(env_idx),
+            "task_name": self._as_scalar(info.get("task_name"), env_idx),
+            "instruction": self._as_scalar(info.get("instruction"), env_idx),
+            "episode_config_id": self._as_scalar(info.get("episode_config_id"), env_idx),
+            "success": bool(self._as_scalar(info.get("success", False), env_idx)),
+            "success_once": bool(self._as_scalar(info.get("success_once", False), env_idx)),
+            "episode_return": float(self._as_scalar(info.get("episode_return", 0.0), env_idx)),
+            "elapsed_steps": int(self._as_scalar(info.get("elapsed_steps", 0), env_idx)),
+            "terminated": bool(self._as_scalar(info.get("terminated", False), env_idx)),
+            "truncated": bool(self._as_scalar(info.get("truncated", False), env_idx)),
+            "ik_success_rate": (float(attempts - failures) / attempts if attempts > 0 else None),
+            "ik_failure_count": failures,
+            "ik_failure_rate": (float(failures) / attempts if attempts > 0 else None),
+            "final_reward": float(final_reward),
+            "vector_mode": self.vector_mode,
+            "eval_track": self._to_jsonable(self.eval_track),
+            "episode_config_path": self._to_jsonable(self.episode_config_source),
+            "seed": int(self.seed),
+        }
+        for key in ("progress_score", "intention_score"):
+            if key in info:
+                value = self._as_scalar(info.get(key), env_idx)
+                if value is not None:
+                    record[key] = float(value)
+        return record
+
+    def _write_episode_record(self, record: dict) -> None:
+        if not self.eval_export_enabled:
+            return
+        with open(self.eval_result_path, "a") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        self._write_eval_summary()
+
+    def _write_eval_summary(self) -> None:
+        summary = self._compute_eval_summary()
+        with open(self.eval_summary_path, "w") as f:
+            json.dump(summary, f, indent=2, ensure_ascii=False)
+        rows = summary.get("tasks", {})
+        fieldnames = [
+            "task_name",
+            "num_episodes",
+            "success_rate",
+            "avg_episode_return",
+            "avg_elapsed_steps",
+            "avg_progress_score",
+            "avg_intention_score",
+            "ik_failure_rate",
+        ]
+        with open(self.eval_summary_csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for task_name, metrics in rows.items():
+                row = {"task_name": task_name}
+                row.update({key: metrics.get(key) for key in fieldnames if key != "task_name"})
+                writer.writerow(row)
+
+    def _mean_optional(self, values: list):
+        filtered = [float(value) for value in values if value is not None]
+        if not filtered:
+            return None
+        return float(np.mean(filtered))
+
+    def _compute_eval_summary(self) -> dict:
+        by_task = {}
+        for record in self._episode_records:
+            by_task.setdefault(record["task_name"], []).append(record)
+        task_summary = {}
+        for task_name, records in by_task.items():
+            task_summary[task_name] = {
+                "num_episodes": len(records),
+                "success_rate": float(np.mean([record["success"] for record in records])),
+                "avg_episode_return": float(np.mean([record["episode_return"] for record in records])),
+                "avg_elapsed_steps": float(np.mean([record["elapsed_steps"] for record in records])),
+                "avg_progress_score": self._mean_optional([record.get("progress_score") for record in records]),
+                "avg_intention_score": self._mean_optional([record.get("intention_score") for record in records]),
+                "ik_failure_rate": self._mean_optional([record.get("ik_failure_rate") for record in records]),
+            }
+        all_records = self._episode_records
+        overall = {
+            "num_episodes": len(all_records),
+            "success_rate": float(np.mean([record["success"] for record in all_records])) if all_records else 0.0,
+            "avg_episode_return": float(np.mean([record["episode_return"] for record in all_records])) if all_records else 0.0,
+            "avg_elapsed_steps": float(np.mean([record["elapsed_steps"] for record in all_records])) if all_records else 0.0,
+            "avg_progress_score": self._mean_optional([record.get("progress_score") for record in all_records]),
+            "avg_intention_score": self._mean_optional([record.get("intention_score") for record in all_records]),
+            "ik_failure_rate": self._mean_optional([record.get("ik_failure_rate") for record in all_records]),
+        }
+        return {"overall": overall, "tasks": task_summary}
+
+    def _episode_metrics_from_records(self, records: list[dict]) -> dict:
+        if not records:
+            return {}
+        return {
+            "vlabench/success_rate": torch.tensor([record["success"] for record in records], dtype=torch.float32),
+            "vlabench/avg_episode_return": torch.tensor([record["episode_return"] for record in records], dtype=torch.float32),
+            "vlabench/avg_elapsed_steps": torch.tensor([record["elapsed_steps"] for record in records], dtype=torch.float32),
+            "vlabench/ik_failure_rate": torch.tensor([record.get("ik_failure_rate") or 0.0 for record in records], dtype=torch.float32),
+            "vlabench/avg_progress_score": torch.tensor([record.get("progress_score") or 0.0 for record in records], dtype=torch.float32),
+            "vlabench/avg_intention_score": torch.tensor([record.get("intention_score") or 0.0 for record in records], dtype=torch.float32),
+        }
+
+    def _maybe_record_done_episode(self, env_idx: int, info: dict, final_reward: float):
+        done = bool(self._as_scalar(info.get("terminated", False), env_idx)) or bool(
+            self._as_scalar(info.get("truncated", False), env_idx)
+        )
+        if not done or self._exported_done[env_idx]:
+            return None
+        record = self._build_episode_record(env_idx, info, final_reward)
+        self._episode_records.append(record)
+        self._episode_id_counter += 1
+        self._exported_done[env_idx] = True
+        self._write_episode_record(record)
+        return record
+
+    def _attach_episode_metrics(self, info: dict, records: list[dict]) -> dict:
+        if records:
+            info["episode"] = self._episode_metrics_from_records(records)
+        return info
 
     def _init_subprocess_vector(self) -> None:
         self._load_env = None
@@ -369,6 +577,7 @@ class VLABenchEnv(gym.Env):
                 "return_tensors": False,
                 "task_sample_mode": "sequential",
                 "episode_config_sample_mode": "sequential",
+                "vlabench_eval": {"export_results": False},
             }
         )
         if episode_config is not None:
@@ -410,6 +619,9 @@ class VLABenchEnv(gym.Env):
             self.elapsed_steps[env_idx] = 0
             self.episode_return[env_idx] = 0.0
             self.success_once[env_idx] = False
+            self._exported_done[env_idx] = False
+            self._ik_attempts[env_idx] = 0
+            self._ik_failures[env_idx] = 0
             self._episode_done[env_idx] = False
             self._last_done_obs[env_idx] = None
             self._last_done_info[env_idx] = None
@@ -436,6 +648,9 @@ class VLABenchEnv(gym.Env):
         terminations = np.zeros(self.num_envs, dtype=bool)
         truncations = np.zeros(self.num_envs, dtype=bool)
         for env_idx, (obs, reward, terminated, truncated, info) in enumerate(results):
+            self._update_ik_stats(env_idx, info.get("ik_success"))
+            record = self._maybe_record_done_episode(env_idx, info, reward)
+            self._attach_episode_metrics(info, [record] if record is not None else [])
             obs_list.append(obs)
             infos.append(info)
             rewards[env_idx] = reward
@@ -466,8 +681,13 @@ class VLABenchEnv(gym.Env):
             step_obs = []
             step_infos = []
             for env_idx, (worker_obs_list, worker_rewards, worker_terms, worker_truncs, worker_infos) in enumerate(results):
+                info = worker_infos[step_idx]
+                reward_value = float(worker_rewards[0, step_idx].item())
+                self._update_ik_stats(env_idx, info.get("ik_success"))
+                record = self._maybe_record_done_episode(env_idx, info, reward_value)
+                self._attach_episode_metrics(info, [record] if record is not None else [])
                 step_obs.append(worker_obs_list[step_idx])
-                step_infos.append(worker_infos[step_idx])
+                step_infos.append(info)
                 rewards[env_idx, step_idx] = worker_rewards[0, step_idx]
                 terminations[env_idx, step_idx] = worker_terms[0, step_idx]
                 truncations[env_idx, step_idx] = worker_truncs[0, step_idx]
@@ -642,6 +862,14 @@ class VLABenchEnv(gym.Env):
         for key in ("progress_score", "intention_score"):
             if any(key in info for info in infos):
                 batched[key] = [info.get(key) for info in infos]
+        episode_infos = [info.get("episode") for info in infos if isinstance(info.get("episode"), dict)]
+        if episode_infos:
+            episode = {}
+            for episode_info in episode_infos:
+                for key, value in episode_info.items():
+                    value = value.detach().cpu() if isinstance(value, torch.Tensor) else torch.as_tensor(value)
+                    episode.setdefault(key, []).append(value.reshape(-1).float())
+            batched["episode"] = {key: torch.cat(values, dim=0) for key, values in episode.items()}
         return batched
 
     def _maybe_unbatch_step_return(self, obs, rewards, terminations, truncations, infos, input_was_single: bool):
@@ -680,6 +908,9 @@ class VLABenchEnv(gym.Env):
             self.elapsed_steps[env_idx] = 0
             self.episode_return[env_idx] = 0.0
             self.success_once[env_idx] = False
+            self._exported_done[env_idx] = False
+            self._ik_attempts[env_idx] = 0
+            self._ik_failures[env_idx] = 0
             self._episode_done[env_idx] = False
             self._last_done_obs[env_idx] = None
             self._last_done_info[env_idx] = None
@@ -724,6 +955,7 @@ class VLABenchEnv(gym.Env):
         terminated = bool(success and not self.ignore_terminations)
         truncated = bool(self.elapsed_steps[env_idx] >= self.max_episode_steps)
 
+        self._update_ik_stats(env_idx, ik_success)
         obs = self._get_wrapped_observation_one(env_idx)
         info = self._get_info(
             env_idx,
@@ -732,6 +964,8 @@ class VLABenchEnv(gym.Env):
             terminated=terminated,
             truncated=truncated,
         )
+        record = self._maybe_record_done_episode(env_idx, info, reward)
+        self._attach_episode_metrics(info, [record] if record is not None else [])
         if terminated or truncated:
             self._episode_done[env_idx] = True
             self._last_done_obs[env_idx] = obs
