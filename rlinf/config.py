@@ -1131,9 +1131,26 @@ def validate_embodied_cfg(cfg):
                     assert len(low) == len(high), (
                         "VLABench joint_position_low/high must have the same length"
                     )
-            assert env_cfg.get("reward_mode", "success") == "success", (
-                "VLABench MVP only supports reward_mode='success'"
+            reward_mode = env_cfg.get("reward_mode", "success")
+            assert reward_mode in ["success", "success_plus_progress_delta"], (
+                "VLABench supports reward_mode='success' or 'success_plus_progress_delta'"
             )
+            if reward_mode == "success_plus_progress_delta":
+                assert float(env_cfg.get("progress_reward_coef", 0.5)) >= 0, (
+                    "VLABench progress_reward_coef must be >= 0"
+                )
+                assert float(env_cfg.get("success_reward", 1.0)) >= 0, (
+                    "VLABench success_reward must be >= 0"
+                )
+                assert float(env_cfg.get("progress_delta_clip_max", 1.0)) >= float(
+                    env_cfg.get("progress_delta_clip_min", 0.0)
+                ), "VLABench progress_delta_clip_max must be >= progress_delta_clip_min"
+                assert float(env_cfg.get("step_penalty", 0.0)) >= 0, (
+                    "VLABench step_penalty must be >= 0"
+                )
+                assert float(env_cfg.get("ik_failure_penalty", 0.0)) >= 0, (
+                    "VLABench ik_failure_penalty must be >= 0"
+                )
             assert len(env_cfg.get("ee_frame_offset", [])) == 3, (
                 "VLABench MVP requires ee_frame_offset with 3 values"
             )

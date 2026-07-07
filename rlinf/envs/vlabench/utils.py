@@ -95,8 +95,21 @@ def validate_mvp_config(cfg: Any) -> None:
             )
 
     reward_mode = get_cfg_value(cfg, "reward_mode", "success")
-    if reward_mode != "success":
-        raise NotImplementedError("VLABenchEnv MVP only supports reward_mode='success'")
+    if reward_mode not in ("success", "success_plus_progress_delta"):
+        raise NotImplementedError("VLABenchEnv only supports reward_mode='success' or 'success_plus_progress_delta'")
+    if reward_mode == "success_plus_progress_delta":
+        if float(get_cfg_value(cfg, "success_reward", 1.0)) < 0:
+            raise ValueError("success_reward must be >= 0")
+        if float(get_cfg_value(cfg, "progress_reward_coef", 0.5)) < 0:
+            raise ValueError("progress_reward_coef must be >= 0")
+        clip_min = float(get_cfg_value(cfg, "progress_delta_clip_min", 0.0))
+        clip_max = float(get_cfg_value(cfg, "progress_delta_clip_max", 1.0))
+        if clip_max < clip_min:
+            raise ValueError("progress_delta_clip_max must be >= progress_delta_clip_min")
+        if float(get_cfg_value(cfg, "step_penalty", 0.0)) < 0:
+            raise ValueError("step_penalty must be >= 0")
+        if float(get_cfg_value(cfg, "ik_failure_penalty", 0.0)) < 0:
+            raise ValueError("ik_failure_penalty must be >= 0")
 
     ee_frame_offset = get_cfg_value(cfg, "ee_frame_offset", DEFAULT_EE_FRAME_OFFSET)
     if len(ee_frame_offset) != 3:

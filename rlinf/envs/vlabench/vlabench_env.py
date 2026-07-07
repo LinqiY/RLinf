@@ -156,6 +156,14 @@ class VLABenchEnv(gym.Env):
         self.return_tensors = bool(get_cfg_value(cfg, "return_tensors", False))
         self.control_mode = get_cfg_value(cfg, "control_mode", "ee")
         self.action_mode = get_cfg_value(cfg, "action_mode", "absolute_ee")
+        self.reward_mode = get_cfg_value(cfg, "reward_mode", "success")
+        self.success_reward = float(get_cfg_value(cfg, "success_reward", 1.0))
+        self.progress_reward_coef = float(get_cfg_value(cfg, "progress_reward_coef", 0.5))
+        self.progress_delta_negative = bool(get_cfg_value(cfg, "progress_delta_negative", False))
+        self.progress_delta_clip_min = float(get_cfg_value(cfg, "progress_delta_clip_min", 0.0))
+        self.progress_delta_clip_max = float(get_cfg_value(cfg, "progress_delta_clip_max", 1.0))
+        self.step_penalty = float(get_cfg_value(cfg, "step_penalty", 0.0))
+        self.ik_failure_penalty = float(get_cfg_value(cfg, "ik_failure_penalty", 0.0))
         self.ee_frame_offset = np.asarray(
             get_cfg_value(cfg, "ee_frame_offset", DEFAULT_EE_FRAME_OFFSET),
             dtype=np.float32,
@@ -200,6 +208,10 @@ class VLABenchEnv(gym.Env):
         self.elapsed_steps = np.zeros(self.num_envs, dtype=np.int32)
         self.episode_return = np.zeros(self.num_envs, dtype=np.float32)
         self.success_once = np.zeros(self.num_envs, dtype=bool)
+        self.prev_progress_score = np.zeros(self.num_envs, dtype=np.float32)
+        self.episode_progress_reward = np.zeros(self.num_envs, dtype=np.float32)
+        self.episode_success_reward = np.zeros(self.num_envs, dtype=np.float32)
+        self.total_progress_delta = np.zeros(self.num_envs, dtype=np.float32)
         self.last_raw_obs = [None] * self.num_envs
         self.last_obs = None
         self.last_info = None
@@ -354,6 +366,16 @@ class VLABenchEnv(gym.Env):
             "ik_failure_count": failures,
             "ik_failure_rate": (float(failures) / attempts if attempts > 0 else None),
             "final_reward": float(final_reward),
+            "episode_progress_reward": float(self._as_scalar(info.get("episode_progress_reward", 0.0), env_idx)),
+            "episode_success_reward": float(self._as_scalar(info.get("episode_success_reward", 0.0), env_idx)),
+            "episode_total_reward": float(self._as_scalar(info.get("episode_total_reward", info.get("episode_return", 0.0)), env_idx)),
+            "final_progress_score": (
+                None
+                if self._as_scalar(info.get("final_progress_score", None), env_idx) is None
+                else float(self._as_scalar(info.get("final_progress_score"), env_idx))
+            ),
+            "total_progress_delta": float(self._as_scalar(info.get("total_progress_delta", 0.0), env_idx)),
+            "reward_mode": self._as_scalar(info.get("reward_mode", self.reward_mode), env_idx),
             "vector_mode": self.vector_mode,
             "eval_track": self._to_jsonable(self.eval_track),
             "episode_config_path": self._to_jsonable(self.episode_config_source),
@@ -386,6 +408,9 @@ class VLABenchEnv(gym.Env):
             "avg_elapsed_steps",
             "avg_progress_score",
             "avg_intention_score",
+            "avg_episode_progress_reward",
+            "avg_episode_success_reward",
+            "avg_final_progress_score",
             "ik_failure_rate",
         ]
         with open(self.eval_summary_csv_path, "w", newline="") as f:
@@ -415,6 +440,9 @@ class VLABenchEnv(gym.Env):
                 "avg_elapsed_steps": float(np.mean([record["elapsed_steps"] for record in records])),
                 "avg_progress_score": self._mean_optional([record.get("progress_score") for record in records]),
                 "avg_intention_score": self._mean_optional([record.get("intention_score") for record in records]),
+                "avg_episode_progress_reward": self._mean_optional([record.get("episode_progress_reward") for record in records]),
+                "avg_episode_success_reward": self._mean_optional([record.get("episode_success_reward") for record in records]),
+                "avg_final_progress_score": self._mean_optional([record.get("final_progress_score") for record in records]),
                 "ik_failure_rate": self._mean_optional([record.get("ik_failure_rate") for record in records]),
             }
         all_records = self._episode_records
@@ -425,6 +453,9 @@ class VLABenchEnv(gym.Env):
             "avg_elapsed_steps": float(np.mean([record["elapsed_steps"] for record in all_records])) if all_records else 0.0,
             "avg_progress_score": self._mean_optional([record.get("progress_score") for record in all_records]),
             "avg_intention_score": self._mean_optional([record.get("intention_score") for record in all_records]),
+            "avg_episode_progress_reward": self._mean_optional([record.get("episode_progress_reward") for record in all_records]),
+            "avg_episode_success_reward": self._mean_optional([record.get("episode_success_reward") for record in all_records]),
+            "avg_final_progress_score": self._mean_optional([record.get("final_progress_score") for record in all_records]),
             "ik_failure_rate": self._mean_optional([record.get("ik_failure_rate") for record in all_records]),
         }
         return {"overall": overall, "tasks": task_summary}
@@ -439,6 +470,9 @@ class VLABenchEnv(gym.Env):
             "vlabench/ik_failure_rate": torch.tensor([record.get("ik_failure_rate") or 0.0 for record in records], dtype=torch.float32),
             "vlabench/avg_progress_score": torch.tensor([record.get("progress_score") or 0.0 for record in records], dtype=torch.float32),
             "vlabench/avg_intention_score": torch.tensor([record.get("intention_score") or 0.0 for record in records], dtype=torch.float32),
+            "vlabench/avg_episode_progress_reward": torch.tensor([record.get("episode_progress_reward") or 0.0 for record in records], dtype=torch.float32),
+            "vlabench/avg_episode_success_reward": torch.tensor([record.get("episode_success_reward") or 0.0 for record in records], dtype=torch.float32),
+            "vlabench/avg_final_progress_score": torch.tensor([record.get("final_progress_score") or 0.0 for record in records], dtype=torch.float32),
         }
 
     def _maybe_record_done_episode(self, env_idx: int, info: dict, final_reward: float):
@@ -469,6 +503,10 @@ class VLABenchEnv(gym.Env):
         self.elapsed_steps = np.zeros(self.num_envs, dtype=np.int32)
         self.episode_return = np.zeros(self.num_envs, dtype=np.float32)
         self.success_once = np.zeros(self.num_envs, dtype=bool)
+        self.prev_progress_score = np.zeros(self.num_envs, dtype=np.float32)
+        self.episode_progress_reward = np.zeros(self.num_envs, dtype=np.float32)
+        self.episode_success_reward = np.zeros(self.num_envs, dtype=np.float32)
+        self.total_progress_delta = np.zeros(self.num_envs, dtype=np.float32)
         self.last_raw_obs = [None] * self.num_envs
         self.last_obs = None
         self.last_info = None
@@ -660,6 +698,10 @@ class VLABenchEnv(gym.Env):
             self._last_done_info[env_idx] = None
             self._last_done_termination[env_idx] = False
             self._last_done_truncation[env_idx] = False
+            self.prev_progress_score[env_idx] = float(info.get("prev_progress_score", 0.0) or 0.0)
+            self.episode_progress_reward[env_idx] = 0.0
+            self.episode_success_reward[env_idx] = 0.0
+            self.total_progress_delta[env_idx] = 0.0
             info["task_name"] = task_name
             info["episode_config_id"] = episode_config_id
             obs_list.append(obs)
@@ -793,6 +835,66 @@ class VLABenchEnv(gym.Env):
     def _instruction(self, env_idx: int) -> str:
         return self.envs[env_idx].task.get_instruction() or ""
 
+    def _reset_reward_state(self, env_idx: int) -> tuple[bool, float]:
+        progress_score = self._safe_metric(env_idx, "get_task_progress")
+        progress_available = progress_score is not None
+        progress_value = float(progress_score) if progress_available else 0.0
+        self.prev_progress_score[env_idx] = progress_value
+        self.episode_progress_reward[env_idx] = 0.0
+        self.episode_success_reward[env_idx] = 0.0
+        self.total_progress_delta[env_idx] = 0.0
+        return progress_available, progress_value
+
+    def _compute_reward(self, env_idx: int, success: bool, ik_success: Optional[bool]) -> tuple[float, dict]:
+        progress_score = self._safe_metric(env_idx, "get_task_progress")
+        progress_available = progress_score is not None
+        prev_progress = float(self.prev_progress_score[env_idx])
+        current_progress = float(progress_score) if progress_available else prev_progress
+        progress_delta = current_progress - prev_progress if progress_available else 0.0
+        if progress_available:
+            self.prev_progress_score[env_idx] = current_progress
+
+        progress_delta_for_reward = progress_delta if self.progress_delta_negative else max(progress_delta, 0.0)
+        progress_delta_clipped = float(
+            np.clip(progress_delta_for_reward, self.progress_delta_clip_min, self.progress_delta_clip_max)
+        )
+
+        success_part = self.success_reward * float(success)
+        progress_part = 0.0
+        step_penalty_value = 0.0
+        ik_penalty_value = 0.0
+        if self.reward_mode == "success_plus_progress_delta":
+            progress_part = self.progress_reward_coef * progress_delta_clipped
+            step_penalty_value = self.step_penalty
+            ik_penalty_value = self.ik_failure_penalty * float(ik_success is False)
+            reward = success_part + progress_part - step_penalty_value - ik_penalty_value
+        elif self.reward_mode == "success":
+            success_part = 1.0 if success else 0.0
+            reward = success_part
+        else:
+            raise NotImplementedError(f"Unsupported VLABench reward_mode={self.reward_mode!r}")
+
+        self.episode_success_reward[env_idx] += success_part
+        self.episode_progress_reward[env_idx] += progress_part
+        self.total_progress_delta[env_idx] += progress_delta_clipped
+        return float(reward), {
+            "reward_mode": self.reward_mode,
+            "reward_success": float(success_part),
+            "reward_progress": float(progress_part),
+            "reward_step_penalty": float(step_penalty_value),
+            "reward_ik_penalty": float(ik_penalty_value),
+            "progress_score": (float(current_progress) if progress_available else None),
+            "prev_progress_score": float(prev_progress),
+            "progress_delta": float(progress_delta),
+            "progress_delta_clipped": float(progress_delta_clipped),
+            "progress_available": bool(progress_available),
+            "episode_progress_reward": float(self.episode_progress_reward[env_idx]),
+            "episode_success_reward": float(self.episode_success_reward[env_idx]),
+            "episode_total_reward": float(self.episode_return[env_idx] + reward),
+            "final_progress_score": (float(current_progress) if progress_available else None),
+            "total_progress_delta": float(self.total_progress_delta[env_idx]),
+        }
+
     def _safe_metric(self, env_idx: int, method_name: str):
         env = self.envs[env_idx]
         method = getattr(env, method_name, None)
@@ -818,6 +920,7 @@ class VLABenchEnv(gym.Env):
         ik_success: Optional[bool] = None,
         terminated: bool = False,
         truncated: bool = False,
+        reward_details: Optional[dict] = None,
     ) -> dict:
         info = {
             "task_name": self.env_task_names[env_idx],
@@ -831,9 +934,29 @@ class VLABenchEnv(gym.Env):
             "elapsed_steps": int(self.elapsed_steps[env_idx]),
             "episode_return": float(self.episode_return[env_idx]),
         }
-        progress_score = self._safe_metric(env_idx, "get_task_progress")
-        if progress_score is not None:
-            info["progress_score"] = progress_score
+        if reward_details is None:
+            progress_score = self._safe_metric(env_idx, "get_task_progress")
+            progress_available = progress_score is not None
+            reward_details = {
+                "reward_mode": self.reward_mode,
+                "reward_success": 0.0,
+                "reward_progress": 0.0,
+                "reward_step_penalty": 0.0,
+                "reward_ik_penalty": 0.0,
+                "progress_score": (float(progress_score) if progress_available else None),
+                "prev_progress_score": float(self.prev_progress_score[env_idx]),
+                "progress_delta": 0.0,
+                "progress_delta_clipped": 0.0,
+                "progress_available": bool(progress_available),
+                "episode_progress_reward": float(self.episode_progress_reward[env_idx]),
+                "episode_success_reward": float(self.episode_success_reward[env_idx]),
+                "episode_total_reward": float(self.episode_return[env_idx]),
+                "final_progress_score": (float(progress_score) if progress_available else None),
+                "total_progress_delta": float(self.total_progress_delta[env_idx]),
+            }
+        info.update(reward_details)
+        if reward_details.get("progress_score") is not None:
+            info["progress_score"] = reward_details["progress_score"]
         intention_score = self._safe_metric(env_idx, "get_intention_score")
         if intention_score is not None:
             info["intention_score"] = intention_score
@@ -891,8 +1014,21 @@ class VLABenchEnv(gym.Env):
             "ik_success": torch.tensor([bool(info.get("ik_success", False)) for info in infos], dtype=torch.bool),
             "elapsed_steps": torch.tensor([info["elapsed_steps"] for info in infos], dtype=torch.int32),
             "episode_return": torch.tensor([info["episode_return"] for info in infos], dtype=torch.float32),
+            "reward_success": torch.tensor([info.get("reward_success", 0.0) for info in infos], dtype=torch.float32),
+            "reward_progress": torch.tensor([info.get("reward_progress", 0.0) for info in infos], dtype=torch.float32),
+            "reward_step_penalty": torch.tensor([info.get("reward_step_penalty", 0.0) for info in infos], dtype=torch.float32),
+            "reward_ik_penalty": torch.tensor([info.get("reward_ik_penalty", 0.0) for info in infos], dtype=torch.float32),
+            "prev_progress_score": torch.tensor([info.get("prev_progress_score", 0.0) for info in infos], dtype=torch.float32),
+            "progress_delta": torch.tensor([info.get("progress_delta", 0.0) for info in infos], dtype=torch.float32),
+            "progress_delta_clipped": torch.tensor([info.get("progress_delta_clipped", 0.0) for info in infos], dtype=torch.float32),
+            "progress_available": torch.tensor([info.get("progress_available", False) for info in infos], dtype=torch.bool),
+            "episode_progress_reward": torch.tensor([info.get("episode_progress_reward", 0.0) for info in infos], dtype=torch.float32),
+            "episode_success_reward": torch.tensor([info.get("episode_success_reward", 0.0) for info in infos], dtype=torch.float32),
+            "episode_total_reward": torch.tensor([info.get("episode_total_reward", info["episode_return"]) for info in infos], dtype=torch.float32),
+            "total_progress_delta": torch.tensor([info.get("total_progress_delta", 0.0) for info in infos], dtype=torch.float32),
+            "reward_mode": [info.get("reward_mode", self.reward_mode) for info in infos],
         }
-        for key in ("progress_score", "intention_score"):
+        for key in ("progress_score", "final_progress_score", "intention_score"):
             if any(key in info for info in infos):
                 batched[key] = [info.get(key) for info in infos]
         episode_infos = [info.get("episode") for info in infos if isinstance(info.get("episode"), dict)]
@@ -949,6 +1085,7 @@ class VLABenchEnv(gym.Env):
             self._last_done_info[env_idx] = None
             self._last_done_termination[env_idx] = False
             self._last_done_truncation[env_idx] = False
+            self._reset_reward_state(env_idx)
             obs_list.append(self._get_wrapped_observation_one(env_idx))
             infos.append(self._get_info(env_idx, success=False, ik_success=None))
 
@@ -996,7 +1133,7 @@ class VLABenchEnv(gym.Env):
         self.elapsed_steps[env_idx] += 1
 
         success = bool(self.envs[env_idx].task.should_terminate_episode(self.envs[env_idx].physics))
-        reward = 1.0 if success else 0.0
+        reward, reward_details = self._compute_reward(env_idx, success, ik_success)
         self.episode_return[env_idx] += reward
         self.success_once[env_idx] = bool(self.success_once[env_idx] or success)
 
@@ -1011,6 +1148,7 @@ class VLABenchEnv(gym.Env):
             ik_success=ik_success,
             terminated=terminated,
             truncated=truncated,
+            reward_details=reward_details,
         )
         record = self._maybe_record_done_episode(env_idx, info, reward)
         self._attach_episode_metrics(info, [record] if record is not None else [])
