@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import os
 import sys
 from typing import Any
@@ -47,8 +48,18 @@ def validate_mvp_config(cfg: Any) -> None:
 
     task_name = get_cfg_value(cfg, "task_name")
     task_names = get_cfg_value(cfg, "task_names", None)
-    if not task_name and not task_names:
-        raise ValueError("VLABenchEnv requires task_name or non-empty task_names")
+    eval_track = get_cfg_value(cfg, "eval_track", None)
+    episode_config_path = get_cfg_value(cfg, "episode_config_path", None)
+    if not task_name and not task_names and not eval_track and not episode_config_path:
+        raise ValueError("VLABenchEnv requires task_name, task_names, eval_track, or episode_config_path")
+
+    task_sample_mode = get_cfg_value(cfg, "task_sample_mode", "uniform")
+    if task_sample_mode not in ("uniform", "sequential"):
+        raise ValueError("VLABench task_sample_mode must be 'uniform' or 'sequential'")
+
+    episode_config_sample_mode = get_cfg_value(cfg, "episode_config_sample_mode", "sequential")
+    if episode_config_sample_mode not in ("random", "sequential"):
+        raise ValueError("VLABench episode_config_sample_mode must be 'random' or 'sequential'")
 
     control_mode = get_cfg_value(cfg, "control_mode", "ee")
     if control_mode != "ee":
@@ -82,7 +93,10 @@ def cfg_to_container(value: Any) -> Any:
     return value
 
 
-def normalize_task_names(cfg: Any) -> list[str]:
+def normalize_task_names(cfg: Any, episode_configs: Any = None) -> list[str]:
+    if isinstance(episode_configs, dict) and episode_configs:
+        return [str(name) for name in episode_configs.keys()]
+
     task_names = cfg_to_container(get_cfg_value(cfg, "task_names", None))
     if task_names is None:
         task_name = get_cfg_value(cfg, "task_name", None)
@@ -95,37 +109,65 @@ def normalize_task_names(cfg: Any) -> list[str]:
     return names
 
 
-def load_episode_configs(cfg: Any) -> list[dict] | dict[str, Any] | None:
+def resolve_episode_config_path(cfg: Any) -> str | None:
     path = get_cfg_value(cfg, "episode_config_path", None)
-    eval_track = get_cfg_value(cfg, "eval_track", None)
-    if path is None and isinstance(eval_track, str) and os.path.exists(eval_track):
-        path = eval_track
-    if path is None:
-        return None
+    if path:
+        return str(path)
 
-    loaded = OmegaConf.load(path)
-    container = cfg_to_container(loaded)
+    eval_track = get_cfg_value(cfg, "eval_track", None)
+    if not eval_track:
+        return None
+    eval_track = str(eval_track)
+    if os.path.exists(eval_track):
+        return eval_track
+
+    root = os.environ.get("VLABENCH_ROOT")
+    if root:
+        candidate = os.path.join(
+            root,
+            "configs",
+            "evaluation",
+            "tracks",
+            eval_track if eval_track.endswith(".json") else f"{eval_track}.json",
+        )
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def load_episode_configs(cfg: Any) -> tuple[list[dict] | dict[str, Any] | None, str | None]:
+    path = resolve_episode_config_path(cfg)
+    if path is None:
+        if get_cfg_value(cfg, "eval_track", None):
+            raise FileNotFoundError(
+                "Could not resolve VLABench eval_track. Expected "
+                "$VLABENCH_ROOT/configs/evaluation/tracks/{eval_track}.json or an explicit path."
+            )
+        return None, None
+
+    if str(path).endswith(".json"):
+        with open(path, "r") as f:
+            container = json.load(f)
+    else:
+        loaded = OmegaConf.load(path)
+        container = cfg_to_container(loaded)
     if isinstance(container, (list, dict)):
-        return container
+        return container, path
     raise ValueError(f"Unsupported VLABench episode config format at {path!r}")
 
 
-def select_episode_config(episode_configs: Any, task_name: str, rng: np.random.Generator):
+def get_episode_candidates(episode_configs: Any, task_name: str):
     if episode_configs is None:
         return None
     if isinstance(episode_configs, list):
-        if not episode_configs:
-            return None
-        return episode_configs[int(rng.integers(0, len(episode_configs)))]
+        return episode_configs
     if isinstance(episode_configs, dict):
         task_configs = episode_configs.get(task_name)
         if task_configs is None:
             return None
         if isinstance(task_configs, list):
-            if not task_configs:
-                return None
-            return task_configs[int(rng.integers(0, len(task_configs)))]
-        return task_configs
+            return task_configs
+        return [task_configs]
     return None
 
 

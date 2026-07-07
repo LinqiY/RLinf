@@ -1066,8 +1066,17 @@ def validate_embodied_cfg(cfg):
             assert env_cfg.env_type == "vlabench"
             task_names = env_cfg.get("task_names", None)
             has_task_names = task_names is not None and len(task_names) > 0
-            assert env_cfg.get("task_name", None) or has_task_names, (
-                "VLABench requires task_name or non-empty task_names"
+            assert (
+                env_cfg.get("task_name", None)
+                or has_task_names
+                or env_cfg.get("eval_track", None)
+                or env_cfg.get("episode_config_path", None)
+            ), "VLABench requires task_name, task_names, eval_track, or episode_config_path"
+            assert env_cfg.get("task_sample_mode", "uniform") in ["uniform", "sequential"], (
+                "VLABench task_sample_mode must be 'uniform' or 'sequential'"
+            )
+            assert env_cfg.get("episode_config_sample_mode", "sequential") in ["random", "sequential"], (
+                "VLABench episode_config_sample_mode must be 'random' or 'sequential'"
             )
             assert env_cfg.get("control_mode", "ee") == "ee", (
                 "VLABench MVP only supports control_mode='ee'"

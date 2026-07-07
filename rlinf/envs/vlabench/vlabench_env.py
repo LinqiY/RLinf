@@ -19,9 +19,9 @@ from rlinf.envs.vlabench.utils import (
     ee_action_to_ctrl,
     ensure_vlabench_importable,
     get_cfg_value,
+    get_episode_candidates,
     load_episode_configs,
     normalize_task_names,
-    select_episode_config,
     validate_mvp_config,
     wrap_observation,
 )
@@ -70,8 +70,13 @@ class VLABenchEnv(gym.Env):
         self.seed = int(get_cfg_value(cfg, "seed", 0)) + seed_offset
         self.rng = np.random.default_rng(self.seed)
 
-        self.task_names = normalize_task_names(cfg)
+        self.episode_configs, self.episode_config_source = load_episode_configs(cfg)
+        self.task_names = normalize_task_names(cfg, self.episode_configs)
         self.default_task_name = self.task_names[0]
+        self.task_sample_mode = get_cfg_value(cfg, "task_sample_mode", "uniform")
+        self.episode_config_sample_mode = get_cfg_value(cfg, "episode_config_sample_mode", "sequential")
+        self._task_cursor = 0
+        self._episode_cursors = {task_name: 0 for task_name in self.task_names}
         self.robot = get_cfg_value(cfg, "robot", "franka")
         self.ignore_terminations = bool(get_cfg_value(cfg, "ignore_terminations", False))
         self.auto_reset = bool(get_cfg_value(cfg, "auto_reset", False))
@@ -92,16 +97,17 @@ class VLABenchEnv(gym.Env):
         self.reset_wait_step = int(get_cfg_value(cfg, "reset_wait_step", 10))
         self.random_init = bool(get_cfg_value(cfg, "random_init", True))
         self.eval_track = get_cfg_value(cfg, "eval_track", None)
-        self.episode_configs = load_episode_configs(cfg)
 
         self.envs = []
         self.env_task_names = []
         self.env_episode_configs = []
+        self.env_episode_config_ids = []
         for env_idx in range(self.num_envs):
-            task_name, episode_config = self._sample_task_for_env(env_idx)
+            task_name, episode_config, episode_config_id = self._sample_task_for_env(env_idx)
             self.envs.append(self._make_env(task_name, episode_config))
             self.env_task_names.append(task_name)
             self.env_episode_configs.append(episode_config)
+            self.env_episode_config_ids.append(episode_config_id)
         self.env = self.envs[0]
 
         self.elapsed_steps = np.zeros(self.num_envs, dtype=np.int32)
@@ -161,26 +167,46 @@ class VLABenchEnv(gym.Env):
     def total_num_group_envs(self):
         return self.num_envs
 
-    def _sample_task_for_env(self, env_idx: int) -> tuple[str, Optional[dict]]:
+    def _sample_task_for_env(self, env_idx: int) -> tuple[str, Optional[dict], Optional[str]]:
         del env_idx
-        task_name = self.task_names[int(self.rng.integers(0, len(self.task_names)))]
-        episode_config = select_episode_config(self.episode_configs, task_name, self.rng)
-        return task_name, episode_config
+        if self.task_sample_mode == "sequential":
+            task_idx = self._task_cursor % len(self.task_names)
+            self._task_cursor += 1
+        else:
+            task_idx = int(self.rng.integers(0, len(self.task_names)))
+        task_name = self.task_names[task_idx]
+
+        episode_configs = get_episode_candidates(self.episode_configs, task_name)
+        if not episode_configs:
+            return task_name, None, None
+
+        if self.episode_config_sample_mode == "random":
+            episode_idx = int(self.rng.integers(0, len(episode_configs)))
+        else:
+            episode_idx = self._episode_cursors.get(task_name, 0) % len(episode_configs)
+            self._episode_cursors[task_name] = episode_idx + 1
+        episode_config_id = f"{self.episode_config_source or 'inline'}:{task_name}:{episode_idx}"
+        return task_name, episode_configs[episode_idx], episode_config_id
 
     def _make_env(self, task_name: str, episode_config: Optional[dict]):
+        kwargs = {}
+        if episode_config is not None:
+            kwargs["run_mode"] = "eval"
         env = self._load_env(
             task_name,
             robot=self.robot,
             reset_wait_step=self.reset_wait_step,
-            random_init=self.random_init,
+            random_init=(False if episode_config is not None else self.random_init),
             episode_config=episode_config,
+            **kwargs,
         )
         env.render_options = {"height": self.render_height, "width": self.render_width}
         return env
 
     def _maybe_resample_env(self, env_idx: int) -> None:
-        task_name, episode_config = self._sample_task_for_env(env_idx)
+        task_name, episode_config, episode_config_id = self._sample_task_for_env(env_idx)
         if task_name == self.env_task_names[env_idx] and episode_config == self.env_episode_configs[env_idx]:
+            self.env_episode_config_ids[env_idx] = episode_config_id
             return
         old_env = self.envs[env_idx]
         if hasattr(old_env, "close"):
@@ -188,6 +214,7 @@ class VLABenchEnv(gym.Env):
         self.envs[env_idx] = self._make_env(task_name, episode_config)
         self.env_task_names[env_idx] = task_name
         self.env_episode_configs[env_idx] = episode_config
+        self.env_episode_config_ids[env_idx] = episode_config_id
         if env_idx == 0:
             self.env = self.envs[0]
 
@@ -200,7 +227,10 @@ class VLABenchEnv(gym.Env):
         if method is None:
             return None
         try:
-            value = method()
+            if method_name == "get_intention_score":
+                value = method(threshold=float(get_cfg_value(self.cfg, "intention_score_threshold", 0.1)))
+            else:
+                value = method()
         except Exception:
             return None
         try:
@@ -208,12 +238,23 @@ class VLABenchEnv(gym.Env):
         except (TypeError, ValueError):
             return value
 
-    def _get_info(self, env_idx: int, *, success: bool, ik_success: Optional[bool] = None) -> dict:
+    def _get_info(
+        self,
+        env_idx: int,
+        *,
+        success: bool,
+        ik_success: Optional[bool] = None,
+        terminated: bool = False,
+        truncated: bool = False,
+    ) -> dict:
         info = {
             "task_name": self.env_task_names[env_idx],
             "instruction": self._instruction(env_idx),
+            "episode_config_id": self.env_episode_config_ids[env_idx],
             "success": bool(success),
             "success_once": bool(self.success_once[env_idx]),
+            "terminated": bool(terminated),
+            "truncated": bool(truncated),
             "ik_success": ik_success,
             "elapsed_steps": int(self.elapsed_steps[env_idx]),
             "episode_return": float(self.episode_return[env_idx]),
@@ -270,8 +311,11 @@ class VLABenchEnv(gym.Env):
         batched = {
             "task_name": [info["task_name"] for info in infos],
             "instruction": [info["instruction"] for info in infos],
+            "episode_config_id": [info.get("episode_config_id") for info in infos],
             "success": torch.tensor([info["success"] for info in infos], dtype=torch.bool),
             "success_once": torch.tensor([info["success_once"] for info in infos], dtype=torch.bool),
+            "terminated": torch.tensor([info.get("terminated", False) for info in infos], dtype=torch.bool),
+            "truncated": torch.tensor([info.get("truncated", False) for info in infos], dtype=torch.bool),
             "ik_success": torch.tensor([bool(info.get("ik_success", False)) for info in infos], dtype=torch.bool),
             "elapsed_steps": torch.tensor([info["elapsed_steps"] for info in infos], dtype=torch.int32),
             "episode_return": torch.tensor([info["episode_return"] for info in infos], dtype=torch.float32),
@@ -359,7 +403,13 @@ class VLABenchEnv(gym.Env):
         truncated = bool(self.elapsed_steps[env_idx] >= self.max_episode_steps)
 
         obs = self._get_wrapped_observation_one(env_idx)
-        info = self._get_info(env_idx, success=success, ik_success=ik_success)
+        info = self._get_info(
+            env_idx,
+            success=success,
+            ik_success=ik_success,
+            terminated=terminated,
+            truncated=truncated,
+        )
         if terminated or truncated:
             self._episode_done[env_idx] = True
             self._last_done_obs[env_idx] = obs
@@ -491,15 +541,38 @@ class VLABenchEnv(gym.Env):
     def update_reset_state_ids(self):
         return None
 
-    def render(self, info=None, rew=None, env_idx: int = 0):
-        env_idx = int(env_idx)
-        if env_idx < 0 or env_idx >= self.num_envs:
-            raise IndexError(f"env_idx {env_idx} out of range for num_envs={self.num_envs}")
+    def _render_one(self, env_idx: int):
         return self.envs[env_idx].render(
             camera_id=self.camera_id,
             height=self.render_height,
             width=self.render_width,
-        )
+        ).astype(np.uint8, copy=False)
+
+    def _tile_images(self, images: list[np.ndarray]) -> np.ndarray:
+        if len(images) == 1:
+            return images[0]
+        height, width, channels = images[0].shape
+        cols = int(np.ceil(np.sqrt(len(images))))
+        rows = int(np.ceil(len(images) / cols))
+        canvas = np.zeros((rows * height, cols * width, channels), dtype=np.uint8)
+        for idx, image in enumerate(images):
+            row = idx // cols
+            col = idx % cols
+            canvas[row * height : (row + 1) * height, col * width : (col + 1) * width] = image
+        return canvas
+
+    def render(self, info=None, rew=None, mode: str = "rgb_array", env_idx: int = 0, tile: Optional[bool] = None):
+        if mode != "rgb_array":
+            raise NotImplementedError("VLABenchEnv only supports render(mode='rgb_array')")
+        if tile is None:
+            tile = False
+        if tile:
+            return self._tile_images([self._render_one(i) for i in range(self.num_envs)])
+
+        env_idx = int(env_idx)
+        if env_idx < 0 or env_idx >= self.num_envs:
+            raise IndexError(f"env_idx {env_idx} out of range for num_envs={self.num_envs}")
+        return self._render_one(env_idx)
 
     def close(self):
         for env in getattr(self, "envs", []):
