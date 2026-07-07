@@ -136,6 +136,12 @@ def resolve_episode_config_path(cfg: Any) -> str | None:
 
 
 def load_episode_configs(cfg: Any) -> tuple[list[dict] | dict[str, Any] | None, str | None]:
+    inline_configs = cfg_to_container(get_cfg_value(cfg, "episode_configs", None))
+    if inline_configs is not None:
+        if isinstance(inline_configs, (list, dict)):
+            return inline_configs, "inline"
+        raise ValueError("VLABench episode_configs must be a list or dict when provided")
+
     path = resolve_episode_config_path(cfg)
     if path is None:
         if get_cfg_value(cfg, "eval_track", None):

@@ -4,10 +4,13 @@
 
 from __future__ import annotations
 
+import multiprocessing as mp
+import traceback
 from typing import Optional
 
 import numpy as np
 import torch
+from omegaconf import OmegaConf
 
 try:
     import gymnasium as gym
@@ -18,6 +21,7 @@ from rlinf.envs.vlabench.utils import (
     DEFAULT_EE_FRAME_OFFSET,
     ee_action_to_ctrl,
     ensure_vlabench_importable,
+    cfg_to_container,
     get_cfg_value,
     get_episode_candidates,
     load_episode_configs,
@@ -27,6 +31,64 @@ from rlinf.envs.vlabench.utils import (
 )
 
 __all__ = ["VLABenchEnv"]
+
+
+def _vlabench_subprocess_worker(remote, parent_remote, worker_id: int):
+    parent_remote.close()
+    env = None
+    current_cfg = None
+    try:
+        while True:
+            cmd, payload = remote.recv()
+            try:
+                if cmd == "reset":
+                    cfg, seed_offset = payload
+                    if env is not None:
+                        env.close()
+                    env = VLABenchEnv(
+                        cfg=cfg,
+                        num_envs=1,
+                        seed_offset=seed_offset,
+                        total_num_processes=1,
+                        worker_info=None,
+                    )
+                    current_cfg = cfg
+                    remote.send(("ok", env.reset()))
+                elif cmd == "step":
+                    if env is None:
+                        raise RuntimeError("worker env is not initialized")
+                    remote.send(("ok", env.step(payload)))
+                elif cmd == "chunk_step":
+                    if env is None:
+                        raise RuntimeError("worker env is not initialized")
+                    remote.send(("ok", env.chunk_step(payload)))
+                elif cmd == "render":
+                    if env is None:
+                        raise RuntimeError("worker env is not initialized")
+                    remote.send(("ok", env.render(**(payload or {}))))
+                elif cmd == "close":
+                    if env is not None:
+                        env.close()
+                        env = None
+                    remote.send(("ok", None))
+                    break
+                elif cmd == "get_attr":
+                    if env is None:
+                        raise RuntimeError("worker env is not initialized")
+                    remote.send(("ok", getattr(env, payload)))
+                else:
+                    raise RuntimeError(f"unknown VLABench subprocess command: {cmd}")
+            except Exception:
+                remote.send(("error", traceback.format_exc()))
+    except (EOFError, KeyboardInterrupt):
+        pass
+    finally:
+        if env is not None:
+            try:
+                env.close()
+            except Exception:
+                pass
+        remote.close()
 
 
 class VLABenchEnv(gym.Env):
@@ -53,16 +115,18 @@ class VLABenchEnv(gym.Env):
         super().__init__()
         validate_mvp_config(cfg)
 
-        ensure_vlabench_importable()
-        from VLABench.envs import load_env
-
-        self._load_env = load_env
         self.cfg = cfg
         cfg_num_envs = get_cfg_value(cfg, "num_envs", None)
         total_num_envs = get_cfg_value(cfg, "total_num_envs", None)
         self.num_envs = int(num_envs or cfg_num_envs or total_num_envs or 1)
         if self.num_envs < 1:
             raise ValueError("VLABenchEnv requires num_envs >= 1")
+
+        self.vector_mode = get_cfg_value(cfg, "vector_mode", None)
+        if self.vector_mode is None:
+            self.vector_mode = "subprocess" if bool(get_cfg_value(cfg, "use_subprocess_env", False)) else "sync"
+        if self.vector_mode not in ("sync", "subprocess"):
+            raise ValueError("VLABenchEnv vector_mode must be 'sync' or 'subprocess'")
 
         self.seed_offset = seed_offset
         self.total_num_processes = total_num_processes
@@ -98,6 +162,14 @@ class VLABenchEnv(gym.Env):
         self.random_init = bool(get_cfg_value(cfg, "random_init", True))
         self.eval_track = get_cfg_value(cfg, "eval_track", None)
 
+        if self.vector_mode == "subprocess":
+            self._init_subprocess_vector()
+            return
+
+        ensure_vlabench_importable()
+        from VLABench.envs import load_env
+
+        self._load_env = load_env
         self.envs = []
         self.env_task_names = []
         self.env_episode_configs = []
@@ -166,6 +238,253 @@ class VLABenchEnv(gym.Env):
     @property
     def total_num_group_envs(self):
         return self.num_envs
+
+    def _init_subprocess_vector(self) -> None:
+        self._load_env = None
+        self.envs = []
+        self.env = None
+        self.env_task_names = [None] * self.num_envs
+        self.env_episode_configs = [None] * self.num_envs
+        self.env_episode_config_ids = [None] * self.num_envs
+        self.elapsed_steps = np.zeros(self.num_envs, dtype=np.int32)
+        self.episode_return = np.zeros(self.num_envs, dtype=np.float32)
+        self.success_once = np.zeros(self.num_envs, dtype=bool)
+        self.last_raw_obs = [None] * self.num_envs
+        self.last_obs = None
+        self.last_info = None
+        self._episode_done = np.zeros(self.num_envs, dtype=bool)
+        self._last_done_obs = [None] * self.num_envs
+        self._last_done_info = [None] * self.num_envs
+        self._last_done_termination = np.zeros(self.num_envs, dtype=bool)
+        self._last_done_truncation = np.zeros(self.num_envs, dtype=bool)
+        self._closed = False
+
+        self._subproc_ctx = mp.get_context("spawn")
+        self._subproc_remotes = []
+        self._subproc_processes = []
+        for worker_id in range(self.num_envs):
+            parent_remote, child_remote = self._subproc_ctx.Pipe()
+            process = self._subproc_ctx.Process(
+                target=_vlabench_subprocess_worker,
+                args=(child_remote, parent_remote, worker_id),
+                daemon=True,
+            )
+            process.start()
+            child_remote.close()
+            self._subproc_remotes.append(parent_remote)
+            self._subproc_processes.append(process)
+
+        action_shape = (7,) if self.num_envs == 1 else (self.num_envs, 7)
+        self.action_space = gym.spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=action_shape,
+            dtype=np.float32,
+        )
+        self.observation_space = gym.spaces.Dict(
+            {
+                "main_images": gym.spaces.Box(
+                    low=0,
+                    high=255,
+                    shape=(self.num_envs, self.render_height, self.render_width, 3),
+                    dtype=np.uint8,
+                ),
+                "extra_view_images": gym.spaces.Box(
+                    low=0,
+                    high=255,
+                    shape=(self.num_envs, 0, self.render_height, self.render_width, 3),
+                    dtype=np.uint8,
+                ),
+                "states": gym.spaces.Box(
+                    low=-np.inf,
+                    high=np.inf,
+                    shape=(self.num_envs, 7),
+                    dtype=np.float32,
+                ),
+                "task_descriptions": gym.spaces.Sequence(gym.spaces.Text(max_length=1024)),
+            }
+        )
+
+    def _assert_subprocess_alive(self, env_idx: int) -> None:
+        process = self._subproc_processes[env_idx]
+        if not process.is_alive():
+            raise RuntimeError(
+                f"VLABench subprocess worker {env_idx} is not alive; exitcode={process.exitcode}"
+            )
+
+    def _subprocess_call(self, env_idx: int, cmd: str, payload=None):
+        if self._closed:
+            raise RuntimeError("VLABench subprocess vector env is already closed")
+        self._assert_subprocess_alive(env_idx)
+        remote = self._subproc_remotes[env_idx]
+        try:
+            remote.send((cmd, payload))
+            status, result = remote.recv()
+        except (EOFError, BrokenPipeError) as exc:
+            raise RuntimeError(f"VLABench subprocess worker {env_idx} pipe failed") from exc
+        if status == "error":
+            raise RuntimeError(f"VLABench subprocess worker {env_idx} failed:\n{result}")
+        return result
+
+    def _subprocess_send_all(self, cmd: str, payloads: list):
+        if self._closed:
+            raise RuntimeError("VLABench subprocess vector env is already closed")
+        for env_idx, payload in enumerate(payloads):
+            self._assert_subprocess_alive(env_idx)
+            self._subproc_remotes[env_idx].send((cmd, payload))
+
+    def _subprocess_recv_all(self, cmd: str):
+        results = []
+        for env_idx, remote in enumerate(self._subproc_remotes):
+            try:
+                status, result = remote.recv()
+            except (EOFError, BrokenPipeError) as exc:
+                raise RuntimeError(
+                    f"VLABench subprocess worker {env_idx} pipe failed during {cmd}"
+                ) from exc
+            if status == "error":
+                raise RuntimeError(f"VLABench subprocess worker {env_idx} failed during {cmd}:\n{result}")
+            results.append(result)
+        return results
+
+    def _make_child_cfg(self, task_name: str, episode_config: Optional[dict]) -> dict:
+        base = cfg_to_container(self.cfg)
+        if base is None:
+            base = {}
+        if not isinstance(base, dict):
+            if hasattr(base, "__dict__"):
+                base = dict(vars(base))
+            else:
+                base = dict(base)
+        base.update(
+            {
+                "num_envs": 1,
+                "total_num_envs": 1,
+                "vector_mode": "sync",
+                "use_subprocess_env": False,
+                "task_name": task_name,
+                "task_names": None,
+                "eval_track": None,
+                "episode_config_path": None,
+                "return_tensors": False,
+                "task_sample_mode": "sequential",
+                "episode_config_sample_mode": "sequential",
+            }
+        )
+        if episode_config is not None:
+            base["episode_configs"] = {task_name: [episode_config]}
+            base["random_init"] = False
+        else:
+            base.pop("episode_configs", None)
+        return base
+
+    def _subprocess_reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
+        if seed is not None:
+            self.seed = int(seed) + self.seed_offset
+            self.rng = np.random.default_rng(self.seed)
+            np.random.seed(self.seed)
+        else:
+            np.random.seed(self.seed)
+        if options:
+            unsupported = sorted(options)
+            raise NotImplementedError(
+                f"VLABenchEnv subprocess mode does not support partial reset options: {unsupported}"
+            )
+
+        payloads = []
+        sampled = []
+        for env_idx in range(self.num_envs):
+            task_name, episode_config, episode_config_id = self._sample_task_for_env(env_idx)
+            child_cfg = self._make_child_cfg(task_name, episode_config)
+            payloads.append((child_cfg, self.seed_offset + env_idx))
+            sampled.append((task_name, episode_config, episode_config_id))
+
+        self._subprocess_send_all("reset", payloads)
+        results = self._subprocess_recv_all("reset")
+        obs_list = []
+        infos = []
+        for env_idx, ((obs, info), (task_name, episode_config, episode_config_id)) in enumerate(zip(results, sampled)):
+            self.env_task_names[env_idx] = task_name
+            self.env_episode_configs[env_idx] = episode_config
+            self.env_episode_config_ids[env_idx] = episode_config_id
+            self.elapsed_steps[env_idx] = 0
+            self.episode_return[env_idx] = 0.0
+            self.success_once[env_idx] = False
+            self._episode_done[env_idx] = False
+            self._last_done_obs[env_idx] = None
+            self._last_done_info[env_idx] = None
+            self._last_done_termination[env_idx] = False
+            self._last_done_truncation[env_idx] = False
+            info["task_name"] = task_name
+            info["episode_config_id"] = episode_config_id
+            obs_list.append(obs)
+            infos.append(info)
+
+        obs = self._merge_obs(obs_list)
+        formatted_obs = self._format_obs(obs)
+        self.last_obs = obs
+        self.last_info = infos[0] if self.num_envs == 1 else self._batch_info(infos)
+        return formatted_obs, self.last_info
+
+    def _subprocess_step(self, action):
+        actions, input_was_single = self._normalize_step_actions(action)
+        self._subprocess_send_all("step", [actions[i] for i in range(self.num_envs)])
+        results = self._subprocess_recv_all("step")
+        obs_list = []
+        infos = []
+        rewards = np.zeros(self.num_envs, dtype=np.float32)
+        terminations = np.zeros(self.num_envs, dtype=bool)
+        truncations = np.zeros(self.num_envs, dtype=bool)
+        for env_idx, (obs, reward, terminated, truncated, info) in enumerate(results):
+            obs_list.append(obs)
+            infos.append(info)
+            rewards[env_idx] = reward
+            terminations[env_idx] = terminated
+            truncations[env_idx] = truncated
+        formatted_obs = self._format_obs(self._merge_obs(obs_list))
+        self.last_info = infos[0] if self.num_envs == 1 else self._batch_info(infos)
+        return self._maybe_unbatch_step_return(
+            formatted_obs,
+            rewards,
+            terminations,
+            truncations,
+            infos,
+            input_was_single,
+        )
+
+    def _subprocess_chunk_step(self, chunk_actions):
+        actions = self._normalize_chunk_actions(chunk_actions)
+        self._subprocess_send_all("chunk_step", [actions[i] for i in range(self.num_envs)])
+        results = self._subprocess_recv_all("chunk_step")
+        chunk_size = actions.shape[1]
+        obs_list = []
+        infos_list = []
+        rewards = torch.zeros((self.num_envs, chunk_size), dtype=torch.float32)
+        terminations = torch.zeros((self.num_envs, chunk_size), dtype=torch.bool)
+        truncations = torch.zeros((self.num_envs, chunk_size), dtype=torch.bool)
+        for step_idx in range(chunk_size):
+            step_obs = []
+            step_infos = []
+            for env_idx, (worker_obs_list, worker_rewards, worker_terms, worker_truncs, worker_infos) in enumerate(results):
+                step_obs.append(worker_obs_list[step_idx])
+                step_infos.append(worker_infos[step_idx])
+                rewards[env_idx, step_idx] = worker_rewards[0, step_idx]
+                terminations[env_idx, step_idx] = worker_terms[0, step_idx]
+                truncations[env_idx, step_idx] = worker_truncs[0, step_idx]
+            obs_list.append(self._format_obs(self._merge_obs(step_obs)))
+            infos_list.append(step_infos[0] if self.num_envs == 1 else self._batch_info(step_infos))
+        return obs_list, rewards, terminations, truncations, infos_list
+
+    def _subprocess_render(self, *, mode: str = "rgb_array", env_idx: int = 0, tile: Optional[bool] = None):
+        if mode != "rgb_array":
+            raise NotImplementedError("VLABenchEnv only supports render(mode='rgb_array')")
+        if tile:
+            images = [self._subprocess_call(i, "render", {"mode": mode}) for i in range(self.num_envs)]
+            return self._tile_images(images)
+        env_idx = int(env_idx)
+        if env_idx < 0 or env_idx >= self.num_envs:
+            raise IndexError(f"env_idx {env_idx} out of range for num_envs={self.num_envs}")
+        return self._subprocess_call(env_idx, "render", {"mode": mode})
 
     def _sample_task_for_env(self, env_idx: int) -> tuple[str, Optional[dict], Optional[str]]:
         del env_idx
@@ -337,6 +656,9 @@ class VLABenchEnv(gym.Env):
         )
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
+        if self.vector_mode == "subprocess":
+            return self._subprocess_reset(seed=seed, options=options)
+
         if seed is not None:
             self.seed = int(seed) + self.seed_offset
             self.rng = np.random.default_rng(self.seed)
@@ -439,6 +761,9 @@ class VLABenchEnv(gym.Env):
         return actions, input_was_single
 
     def step(self, action):
+        if self.vector_mode == "subprocess":
+            return self._subprocess_step(action)
+
         actions, input_was_single = self._normalize_step_actions(action)
         obs_list = []
         infos = []
@@ -496,6 +821,9 @@ class VLABenchEnv(gym.Env):
         return np.nan_to_num(actions, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
 
     def chunk_step(self, chunk_actions):
+        if self.vector_mode == "subprocess":
+            return self._subprocess_chunk_step(chunk_actions)
+
         actions = self._normalize_chunk_actions(chunk_actions)
         if actions.shape[0] != self.num_envs:
             raise ValueError(f"chunk action batch {actions.shape[0]} != num_envs {self.num_envs}")
@@ -562,6 +890,9 @@ class VLABenchEnv(gym.Env):
         return canvas
 
     def render(self, info=None, rew=None, mode: str = "rgb_array", env_idx: int = 0, tile: Optional[bool] = None):
+        if self.vector_mode == "subprocess":
+            return self._subprocess_render(mode=mode, env_idx=env_idx, tile=tile)
+
         if mode != "rgb_array":
             raise NotImplementedError("VLABenchEnv only supports render(mode='rgb_array')")
         if tile is None:
@@ -575,6 +906,36 @@ class VLABenchEnv(gym.Env):
         return self._render_one(env_idx)
 
     def close(self):
+        if getattr(self, "vector_mode", "sync") == "subprocess":
+            if getattr(self, "_closed", False):
+                return
+            self._closed = True
+            for env_idx, remote in enumerate(getattr(self, "_subproc_remotes", [])):
+                try:
+                    if self._subproc_processes[env_idx].is_alive():
+                        remote.send(("close", None))
+                except (BrokenPipeError, EOFError, OSError):
+                    pass
+            for env_idx, remote in enumerate(getattr(self, "_subproc_remotes", [])):
+                try:
+                    if self._subproc_processes[env_idx].is_alive() and remote.poll(5.0):
+                        remote.recv()
+                except (BrokenPipeError, EOFError, OSError):
+                    pass
+                try:
+                    remote.close()
+                except OSError:
+                    pass
+            for process in getattr(self, "_subproc_processes", []):
+                process.join(timeout=5.0)
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=2.0)
+                if process.is_alive():
+                    process.kill()
+                    process.join(timeout=2.0)
+            return
+
         for env in getattr(self, "envs", []):
             if env is not None and hasattr(env, "close"):
                 env.close()

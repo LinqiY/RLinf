@@ -1078,6 +1078,17 @@ def validate_embodied_cfg(cfg):
             assert env_cfg.get("episode_config_sample_mode", "sequential") in ["random", "sequential"], (
                 "VLABench episode_config_sample_mode must be 'random' or 'sequential'"
             )
+            assert env_cfg.get("vector_mode", "sync") in ["sync", "subprocess"], (
+                "VLABench vector_mode must be 'sync' or 'subprocess'"
+            )
+            if env_cfg.get("use_subprocess_env", None) is not None:
+                assert isinstance(env_cfg.get("use_subprocess_env"), bool), (
+                    "VLABench use_subprocess_env must be a bool"
+                )
+            if env_cfg.get("vector_mode", "sync") == "subprocess":
+                assert int(env_cfg.get("num_envs", env_cfg.get("total_num_envs", 1))) >= 1, (
+                    "VLABench subprocess vector mode requires num_envs >= 1"
+                )
             assert env_cfg.get("control_mode", "ee") == "ee", (
                 "VLABench MVP only supports control_mode='ee'"
             )
