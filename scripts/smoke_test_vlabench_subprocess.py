@@ -17,8 +17,8 @@ VLABENCH_REPO = WORKSPACE_ROOT / "VLABench"
 VLABENCH_ROOT = VLABENCH_REPO / "VLABench"
 
 os.environ.setdefault("VLABENCH_ROOT", str(VLABENCH_ROOT))
-os.environ["MUJOCO_GL"] = "osmesa"
-os.environ["PYOPENGL_PLATFORM"] = "osmesa"
+os.environ.setdefault("MUJOCO_GL", "osmesa")
+os.environ.setdefault("PYOPENGL_PLATFORM", "osmesa")
 for path in (str(REPO_ROOT), str(VLABENCH_REPO)):
     if path not in sys.path:
         sys.path.insert(0, path)

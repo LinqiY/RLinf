@@ -1,0 +1,153 @@
+defaults:
+  - env/vlabench_select_fruit@env.train
+  - model/mlp_policy@actor.model
+  - training_backend/fsdp@actor.fsdp_config
+  - weight_syncer/patch_syncer@weight_syncer
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    env,rollout,actor: 0
+
+runner:
+  task_type: embodied
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "vlabench_egl_subprocess_numenv8_smoke"
+    logger_backends: ["tensorboard"]
+
+  max_epochs: 50
+  max_steps: 50
+  only_eval: false
+  val_check_interval: -1
+  save_interval: -1
+  resume_dir: null
+  ckpt_path: null
+  weight_sync_interval: 1
+
+algorithm:
+  update_epoch: 1
+  normalize_advantages: true
+  kl_penalty: kl
+  group_size: 1
+
+  reward_type: action_level
+  logprob_type: action_level
+  entropy_type: action_level
+
+  adv_type: gae
+  loss_type: actor_critic
+  loss_agg_func: "token-mean"
+
+  bootstrap_type: always
+  kl_beta: 0.0
+  entropy_bonus: 0
+  clip_ratio_high: 0.2
+  clip_ratio_low: 0.2
+  clip_ratio_c: 3.0
+  value_clip: 1.0
+  huber_delta: 10.0
+
+  gamma: 0.8
+  gae_lambda: 0.9
+
+  filter_rewards: false
+
+env:
+  group_name: "EnvGroup"
+  train:
+    task_names: [select_fruit, select_drink]
+    task_sample_mode: sequential
+    reward_mode: success_plus_progress_delta
+    success_reward: 1.0
+    progress_reward_coef: 0.5
+    progress_delta_negative: false
+    progress_delta_clip_min: 0.0
+    progress_delta_clip_max: 1.0
+    step_penalty: 0.0
+    ik_failure_penalty: 0.0
+    vlabench_eval:
+      export_results: true
+      result_path: ${runner.logger.log_path}/vlabench_egl_subprocess_numenv8_smoke/vlabench_results.jsonl
+      summary_path: ${runner.logger.log_path}/vlabench_egl_subprocess_numenv8_smoke/vlabench_summary.json
+      summary_csv_path: ${runner.logger.log_path}/vlabench_egl_subprocess_numenv8_smoke/vlabench_summary.csv
+      export_format: jsonl
+    rollout_epoch: 1
+    total_num_envs: 8
+    num_envs: 8
+    vector_mode: subprocess
+    group_size: 1
+    auto_reset: false
+    ignore_terminations: false
+    max_episode_steps: 20
+    max_steps_per_rollout_epoch: 20
+    return_tensors: true
+    video_cfg:
+      save_video: false
+      info_on_video: false
+      video_base_dir: ${runner.logger.log_path}/video/train
+
+rollout:
+  group_name: "RolloutGroup"
+  backend: "huggingface"
+  enable_offload: false
+  pipeline_stage_num: 1
+  collect_transitions: false
+  collect_prev_infos: true
+
+  model:
+    model_path: ""
+    precision: ${actor.model.precision}
+
+  enable_torch_compile: false
+  enable_cuda_graph: false
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 1
+  global_batch_size: 160
+  seed: 1234
+  enable_offload: false
+
+  model:
+    model_path: ""
+    model_type: "mlp_policy"
+    obs_dim: 7
+    action_dim: 7
+    num_action_chunks: 1
+    hidden_dim: 64
+    precision: "32"
+    add_value_head: true
+
+  optim:
+    lr: 3.0e-4
+    value_lr: 3.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_eps: 1.0e-08
+    weight_decay: 0.01
+    clip_grad: 0.5
+
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "no_shard"
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
+
+reward:
+  use_reward_model: false
+
+critic:
+  use_critic_model: false

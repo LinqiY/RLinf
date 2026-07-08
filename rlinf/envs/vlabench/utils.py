@@ -18,6 +18,13 @@ DEFAULT_EE_FRAME_OFFSET = np.array([0.0, -0.4, 0.78], dtype=np.float32)
 
 def ensure_vlabench_importable():
     """Import VLABench and register its task/robot classes."""
+    if (
+        os.environ.get("MUJOCO_GL") == "egl"
+        and os.environ.get("MUJOCO_EGL_DEVICE_ID") is not None
+        and os.environ.get("VLABENCH_KEEP_MUJOCO_EGL_DEVICE_ID") != "1"
+    ):
+        os.environ.pop("MUJOCO_EGL_DEVICE_ID", None)
+
     root = os.environ.get("VLABENCH_ROOT")
     if root:
         package_parent = os.path.dirname(root.rstrip(os.sep))
