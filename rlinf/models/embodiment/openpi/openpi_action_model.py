@@ -803,10 +803,31 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             processed_obs["observation/state_gripper"] = state[:, 6:7]
         else:
             processed_obs["observation/state"] = env_states
-        if env_obs["wrist_images"] is not None:
-            processed_obs["observation/wrist_image"] = env_obs["wrist_images"]
-        if env_obs["extra_view_images"] is not None:
-            processed_obs["observation/extra_view_image"] = env_obs["extra_view_images"]
+
+        if "vlabench" in self.config.config_name:
+            # The VLABench checkpoint was trained with 3 real camera views:
+            # front/main (-> observation/image, already set above),
+            # second (-> observation/second_image), wrist (-> observation/wrist_image).
+            # VLABenchEnv exposes the non-main cameras as `extra_view_images` in the
+            # same order MuJoCo enumerates them, which is [image_0, image_1, wrist]
+            # for the franka camera rig (see VLABench/utils/rlds_builder.py), so the
+            # second view is the first extra camera and the wrist view is the last.
+            extra = env_obs.get("extra_view_images")
+            if extra is None or extra.shape[1] < 2:
+                extra_shape = None if extra is None else tuple(extra.shape)
+                raise ValueError(
+                    "OpenPi VLABench policy requires at least 2 extra camera views "
+                    f"(second_image + wrist_image) but got extra_view_images shape {extra_shape}"
+                )
+            processed_obs["observation/second_image"] = extra[:, 0]
+            processed_obs["observation/wrist_image"] = extra[:, -1]
+        else:
+            wrist_images = env_obs.get("wrist_images")
+            if wrist_images is not None:
+                processed_obs["observation/wrist_image"] = wrist_images
+            extra_view_images = env_obs.get("extra_view_images")
+            if extra_view_images is not None:
+                processed_obs["observation/extra_view_image"] = extra_view_images
         return processed_obs
 
     def precision_processor(self, processed_obs):

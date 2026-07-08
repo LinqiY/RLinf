@@ -21,3 +21,17 @@ rlinf/envs/maniskill/assets
 PKG-INFO
 *.egg-info/
 .claude/settings.json
+
+# Python/tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Experiment artifacts
+wandb/
+runs/
+checkpoints/
+videos/
+*.mp4
+*.jsonl

@@ -73,6 +73,9 @@ from rlinf.models.embodiment.openpi.dataconfig.robocasa_dataconfig import (
 from rlinf.models.embodiment.openpi.dataconfig.robotwin_aloha_dataconfig import (
     LeRobotAlohaDataConfig,
 )
+from rlinf.models.embodiment.openpi.dataconfig.vlabench_dataconfig import (
+    LeRobotVLABenchDataConfig,
+)
 
 _CONFIGS = [
     TrainConfig(
@@ -504,6 +507,22 @@ _CONFIGS = [
             assets=AssetsConfig(asset_id="assets/droid"),
         ),
         pytorch_weight_path="checkpoints/torch/pi0_droid_polaris",
+    ),
+    TrainConfig(
+        name="pi0_ft_vlabench_primitive",
+        model=pi0_config.Pi0Config(paligemma_variant="gemma_2b"),
+        data=LeRobotVLABenchDataConfig(
+            repo_id="vlabench/vlabench_ft_primitive",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(assets_dir="checkpoints/torch/pi0_ft_vlabench_primitive"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "checkpoints/jax/pi0_base/params"
+        ),
+        pytorch_weight_path="checkpoints/torch/pi0_base",
+        num_train_steps=30_000,
+        batch_size=32,
+        num_workers=64,
     ),
     TrainConfig(
         name="pi05_droid_polaris",
