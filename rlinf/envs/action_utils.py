@@ -277,7 +277,7 @@ def prepare_actions_for_vlabench(
     the dm_control physics object is available. This function only converts
     tensors to finite float32 numpy arrays and keeps the first 7 EE dims.
     """
-    del model_type, action_dim
+    del model_type
     valid_pairs = {
         (None, None),
         (None, "absolute_ee"),
@@ -302,10 +302,10 @@ def prepare_actions_for_vlabench(
         raise ValueError(
             f"VLABench actions require at least {expected_dim} dims, got shape {chunk_actions.shape}"
         )
+    if not np.all(np.isfinite(chunk_actions)):
+        raise ValueError(f"VLABench policy actions contain NaN/Inf before env validation: {chunk_actions}")
     chunk_actions = chunk_actions[..., :expected_dim].copy()
-    return np.nan_to_num(chunk_actions, nan=0.0, posinf=0.0, neginf=0.0).astype(
-        np.float32, copy=False
-    )
+    return chunk_actions.astype(np.float32, copy=False)
 
 
 def prepare_actions(

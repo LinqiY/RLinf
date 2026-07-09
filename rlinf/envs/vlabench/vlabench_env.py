@@ -20,6 +20,14 @@ try:
 except ImportError:  # pragma: no cover - legacy fallback
     import gym
 
+from rlinf.envs.vlabench.eval_utils import (
+    append_jsonl,
+    default_debug_dir,
+    episode_config_id as make_episode_config_id,
+    jsonable as vlabench_jsonable,
+    stable_config_hash,
+    write_json,
+)
 from rlinf.envs.vlabench.utils import (
     DEFAULT_EE_FRAME_OFFSET,
     cfg_to_container,
@@ -121,6 +129,9 @@ class VLABenchEnv(gym.Env):
         validate_mvp_config(cfg)
 
         self.cfg = cfg
+        self.vlabench_root_path = get_cfg_value(cfg, "vlabench_root_path", None)
+        if self.vlabench_root_path:
+            os.environ["VLABENCH_ROOT"] = str(self.vlabench_root_path)
         cfg_num_envs = get_cfg_value(cfg, "num_envs", None)
         total_num_envs = get_cfg_value(cfg, "total_num_envs", None)
         self.num_envs = int(num_envs or cfg_num_envs or total_num_envs or 1)
@@ -183,6 +194,11 @@ class VLABenchEnv(gym.Env):
         self.reset_wait_step = int(get_cfg_value(cfg, "reset_wait_step", 10))
         self.random_init = bool(get_cfg_value(cfg, "random_init", True))
         self.eval_track = get_cfg_value(cfg, "eval_track", None)
+        self.require_episode_config = bool(get_cfg_value(cfg, "require_episode_config", False))
+        self.action_validation_cfg = cfg_to_container(get_cfg_value(cfg, "action_validation", {})) or {}
+        self._prev_policy_actions = [None] * self.num_envs
+        self._action_debug_counts = np.zeros(self.num_envs, dtype=np.int32)
+        self._obs_debug_written = False
         self._init_eval_export()
 
         if self.vector_mode == "subprocess":
@@ -303,6 +319,12 @@ class VLABenchEnv(gym.Env):
         self._ik_attempts = np.zeros(self.num_envs, dtype=np.int32)
         self._ik_failures = np.zeros(self.num_envs, dtype=np.int32)
         self._episode_records = []
+        self._failed_episode_records = []
+        self.eval_debug_dir = self._get_nested_cfg_value("vlabench_eval", "debug_dir", None)
+        if self.eval_debug_dir is None:
+            self.eval_debug_dir = default_debug_dir(self.eval_result_path)
+        self.eval_debug_action_steps = int(self._get_nested_cfg_value("vlabench_eval", "debug_action_steps", 5) or 0)
+        self.eval_debug_obs = bool(self._get_nested_cfg_value("vlabench_eval", "debug_observations", True))
         if self.eval_export_enabled:
             result_dir = os.path.dirname(str(self.eval_result_path))
             if result_dir:
@@ -313,6 +335,7 @@ class VLABenchEnv(gym.Env):
             csv_dir = os.path.dirname(str(self.eval_summary_csv_path))
             if csv_dir:
                 os.makedirs(csv_dir, exist_ok=True)
+            os.makedirs(str(self.eval_debug_dir), exist_ok=True)
 
     def _to_jsonable(self, value):
         if isinstance(value, torch.Tensor):
@@ -350,12 +373,18 @@ class VLABenchEnv(gym.Env):
     def _build_episode_record(self, env_idx: int, info: dict, final_reward: float) -> dict:
         attempts = int(self._ik_attempts[env_idx])
         failures = int(self._ik_failures[env_idx])
+        video_base_dir = self._get_nested_cfg_value("video_cfg", "video_base_dir", None)
+        video_path_hint = None
+        if video_base_dir:
+            video_path_hint = os.path.join(str(video_base_dir), f"seed_{self.seed}")
         record = {
             "episode_id": int(self._episode_id_counter),
             "env_id": int(env_idx),
             "task_name": self._as_scalar(info.get("task_name"), env_idx),
             "instruction": self._as_scalar(info.get("instruction"), env_idx),
             "episode_config_id": self._as_scalar(info.get("episode_config_id"), env_idx),
+            "episode_config_hash": self._as_scalar(info.get("episode_config_hash", None), env_idx),
+            "episode_config_source": self._as_scalar(info.get("episode_config_source", None), env_idx),
             "success": bool(self._as_scalar(info.get("success", False), env_idx)),
             "success_once": bool(self._as_scalar(info.get("success_once", False), env_idx)),
             "episode_return": float(self._as_scalar(info.get("episode_return", 0.0), env_idx)),
@@ -379,6 +408,12 @@ class VLABenchEnv(gym.Env):
             "vector_mode": self.vector_mode,
             "eval_track": self._to_jsonable(self.eval_track),
             "episode_config_path": self._to_jsonable(self.episode_config_source),
+            "vlabench_root_path": self._to_jsonable(self.vlabench_root_path),
+            "video_base_dir": self._to_jsonable(video_base_dir),
+            "video_path": self._to_jsonable(video_path_hint),
+            "failure_reason": None if bool(self._as_scalar(info.get("success", False), env_idx)) else (
+                "truncated" if bool(self._as_scalar(info.get("truncated", False), env_idx)) else "terminated_without_success"
+            ),
             "seed": int(self.seed),
         }
         for key in ("progress_score", "intention_score"):
@@ -458,7 +493,19 @@ class VLABenchEnv(gym.Env):
             "avg_final_progress_score": self._mean_optional([record.get("final_progress_score") for record in all_records]),
             "ik_failure_rate": self._mean_optional([record.get("ik_failure_rate") for record in all_records]),
         }
-        return {"overall": overall, "tasks": task_summary}
+        failed = [record for record in all_records if not record.get("success", False)]
+        by_track = {}
+        track_name = str(self.eval_track) if self.eval_track is not None else None
+        if track_name is not None:
+            by_track[track_name] = dict(overall)
+        return {
+            "overall": overall,
+            "tasks": task_summary,
+            "tracks": by_track,
+            "failed_episodes": failed,
+            "episode_config_path": self._to_jsonable(self.episode_config_source),
+            "eval_track": self._to_jsonable(self.eval_track),
+        }
 
     def _episode_metrics_from_records(self, records: list[dict]) -> dict:
         if not records:
@@ -710,8 +757,24 @@ class VLABenchEnv(gym.Env):
         obs = self._merge_obs(obs_list)
         formatted_obs = self._format_obs(obs)
         self.last_obs = obs
+        self._write_observation_debug_once(obs)
         self.last_info = infos[0] if self.num_envs == 1 else self._batch_info(infos)
         return formatted_obs, self.last_info
+
+    def _current_episode_config_hash(self, env_idx: int):
+        episode_id = self.env_episode_config_ids[env_idx]
+        if isinstance(episode_id, str) and "sha1=" in episode_id:
+            return episode_id.rsplit("sha1=", 1)[-1]
+        if self.env_episode_configs[env_idx] is None:
+            return None
+        return stable_config_hash(self.env_episode_configs[env_idx])
+
+    def _stamp_parent_episode_info(self, env_idx: int, info: dict) -> dict:
+        info["task_name"] = self.env_task_names[env_idx]
+        info["episode_config_id"] = self.env_episode_config_ids[env_idx]
+        info["episode_config_source"] = self.episode_config_source
+        info["episode_config_hash"] = self._current_episode_config_hash(env_idx)
+        return info
 
     def _subprocess_step(self, action):
         actions, input_was_single = self._normalize_step_actions(action)
@@ -723,6 +786,7 @@ class VLABenchEnv(gym.Env):
         terminations = np.zeros(self.num_envs, dtype=bool)
         truncations = np.zeros(self.num_envs, dtype=bool)
         for env_idx, (obs, reward, terminated, truncated, info) in enumerate(results):
+            info = self._stamp_parent_episode_info(env_idx, info)
             self._update_ik_stats(env_idx, info.get("ik_success"))
             record = self._maybe_record_done_episode(env_idx, info, reward)
             self._attach_episode_metrics(info, [record] if record is not None else [])
@@ -756,7 +820,7 @@ class VLABenchEnv(gym.Env):
             step_obs = []
             step_infos = []
             for env_idx, (worker_obs_list, worker_rewards, worker_terms, worker_truncs, worker_infos) in enumerate(results):
-                info = worker_infos[step_idx]
+                info = self._stamp_parent_episode_info(env_idx, worker_infos[step_idx])
                 reward_value = float(worker_rewards[0, step_idx].item())
                 self._update_ik_stats(env_idx, info.get("ik_success"))
                 record = self._maybe_record_done_episode(env_idx, info, reward_value)
@@ -792,6 +856,11 @@ class VLABenchEnv(gym.Env):
 
         episode_configs = get_episode_candidates(self.episode_configs, task_name)
         if not episode_configs:
+            if self.require_episode_config:
+                raise RuntimeError(
+                    f"VLABench task {task_name!r} has no episode config candidates while "
+                    "require_episode_config=true. Refusing random reset fallback."
+                )
             return task_name, None, None
 
         if self.episode_config_sample_mode == "random":
@@ -799,8 +868,9 @@ class VLABenchEnv(gym.Env):
         else:
             episode_idx = self._episode_cursors.get(task_name, 0) % len(episode_configs)
             self._episode_cursors[task_name] = episode_idx + 1
-        episode_config_id = f"{self.episode_config_source or 'inline'}:{task_name}:{episode_idx}"
-        return task_name, episode_configs[episode_idx], episode_config_id
+        episode_config = episode_configs[episode_idx]
+        episode_id = make_episode_config_id(self.episode_config_source, task_name, episode_idx, episode_config)
+        return task_name, episode_config, episode_id
 
     def _make_env(self, task_name: str, episode_config: Optional[dict]):
         kwargs = {}
@@ -926,6 +996,8 @@ class VLABenchEnv(gym.Env):
             "task_name": self.env_task_names[env_idx],
             "instruction": self._instruction(env_idx),
             "episode_config_id": self.env_episode_config_ids[env_idx],
+            "episode_config_source": self.episode_config_source,
+            "episode_config_hash": self._current_episode_config_hash(env_idx),
             "success": bool(success),
             "success_once": bool(self.success_once[env_idx]),
             "terminated": bool(terminated),
@@ -1031,14 +1103,25 @@ class VLABenchEnv(gym.Env):
         for key in ("progress_score", "final_progress_score", "intention_score"):
             if any(key in info for info in infos):
                 batched[key] = [info.get(key) for info in infos]
-        episode_infos = [info.get("episode") for info in infos if isinstance(info.get("episode"), dict)]
-        if episode_infos:
+        episode_keys = set()
+        for info in infos:
+            episode_info = info.get("episode")
+            if isinstance(episode_info, dict):
+                episode_keys.update(episode_info.keys())
+        if episode_keys:
             episode = {}
-            for episode_info in episode_infos:
-                for key, value in episode_info.items():
-                    value = value.detach().cpu() if isinstance(value, torch.Tensor) else torch.as_tensor(value)
-                    episode.setdefault(key, []).append(value.reshape(-1).float())
-            batched["episode"] = {key: torch.cat(values, dim=0) for key, values in episode.items()}
+            for key in sorted(episode_keys):
+                values = []
+                for info in infos:
+                    episode_info = info.get("episode")
+                    if isinstance(episode_info, dict) and key in episode_info:
+                        value = episode_info[key]
+                        value = value.detach().cpu() if isinstance(value, torch.Tensor) else torch.as_tensor(value)
+                        values.append(value.reshape(-1).float()[0])
+                    else:
+                        values.append(torch.tensor(0.0, dtype=torch.float32))
+                episode[key] = torch.stack(values, dim=0)
+            batched["episode"] = episode
         return batched
 
     def _maybe_unbatch_step_return(self, obs, rewards, terminations, truncations, infos, input_was_single: bool):
@@ -1092,8 +1175,130 @@ class VLABenchEnv(gym.Env):
         obs = self._merge_obs(obs_list)
         formatted_obs = self._format_obs(obs)
         self.last_obs = obs
+        self._write_observation_debug_once(obs)
         self.last_info = infos[0] if self.num_envs == 1 else self._batch_info(infos)
         return formatted_obs, self.last_info
+
+    def _validate_policy_action(self, env_idx: int, action: np.ndarray) -> None:
+        cfg = self.action_validation_cfg
+        if not bool(cfg.get("enabled", True)):
+            return
+        action = np.asarray(action, dtype=np.float32).reshape(-1)
+        if action.shape != (int(self.policy_action_dim),):
+            raise ValueError(
+                f"VLABench action_dim mismatch: expected {self.policy_action_dim}, got {action.shape}"
+            )
+        if not np.all(np.isfinite(action)):
+            raise ValueError(f"VLABench final policy action is not finite: {action.tolist()}")
+        if self.control_mode == "ee":
+            max_abs_xyz = float(cfg.get("max_abs_xyz", 2.0))
+            max_abs_euler = float(cfg.get("max_abs_euler", 4 * np.pi))
+            gripper_min = float(cfg.get("gripper_min", -1.0))
+            gripper_max = float(cfg.get("gripper_max", 2.0))
+            if np.any(np.abs(action[:3]) > max_abs_xyz):
+                raise ValueError(f"VLABench EE xyz action exceeds {max_abs_xyz}: {action[:3].tolist()}")
+            if np.any(np.abs(action[3:6]) > max_abs_euler):
+                raise ValueError(f"VLABench EE Euler action exceeds {max_abs_euler}: {action[3:6].tolist()}")
+            if not (gripper_min <= float(action[6]) <= gripper_max):
+                raise ValueError(
+                    f"VLABench gripper action {float(action[6])} outside [{gripper_min}, {gripper_max}]"
+                )
+            prev = self._prev_policy_actions[env_idx]
+            if prev is not None:
+                max_step_xyz_delta = float(cfg.get("max_step_xyz_delta", 0.5))
+                max_step_euler_delta = float(cfg.get("max_step_euler_delta", np.pi + 1e-3))
+                d_xyz = action[:3] - prev[:3]
+                d_euler = (action[3:6] - prev[3:6] + np.pi) % (2 * np.pi) - np.pi
+                if np.any(np.abs(d_xyz) > max_step_xyz_delta):
+                    raise ValueError(
+                        f"VLABench single-step xyz delta exceeds {max_step_xyz_delta}: {d_xyz.tolist()}"
+                    )
+                if np.any(np.abs(d_euler) > max_step_euler_delta):
+                    raise ValueError(
+                        f"VLABench single-step Euler delta exceeds {max_step_euler_delta}: {d_euler.tolist()}"
+                    )
+        self._prev_policy_actions[env_idx] = action.copy()
+
+    def _write_observation_debug_once(self, obs: dict) -> None:
+        if not self.eval_export_enabled or not self.eval_debug_obs or self._obs_debug_written:
+            return
+        env_instructions = [self._instruction(i) for i in range(self.num_envs)] if getattr(self, "envs", None) else []
+        payload = {
+            "observation_keys": sorted(obs.keys()),
+            "main_images_shape": list(np.asarray(obs.get("main_images")).shape),
+            "extra_view_images_shape": None if obs.get("extra_view_images") is None else list(np.asarray(obs.get("extra_view_images")).shape),
+            "states_shape": list(np.asarray(obs.get("states")).shape),
+            "task_descriptions": vlabench_jsonable(obs.get("task_descriptions")),
+            "policy_received_instruction": vlabench_jsonable(obs.get("task_descriptions")),
+            "env_instruction": vlabench_jsonable(env_instructions),
+            "camera_id": self.camera_id,
+            "use_extra_views": bool(get_cfg_value(self.cfg, "use_extra_views", True)),
+            "state_semantics": "xyz_local + euler + gripper, where xyz_local = ee_pos - ee_frame_offset",
+            "image_semantics": "main_images uses camera_id; extra_view_images are all remaining VLABench rgb cameras in MuJoCo order",
+        }
+        write_json(os.path.join(str(self.eval_debug_dir), "observation_debug.json"), payload)
+        self._obs_debug_written = True
+
+    def _write_action_debug(self, env_idx: int, policy_action: np.ndarray, ctrl_action: np.ndarray, ik_success) -> None:
+        if not self.eval_export_enabled or self.eval_debug_action_steps <= 0:
+            return
+        if self._action_debug_counts[env_idx] >= self.eval_debug_action_steps:
+            return
+        current_state = None
+        if self.last_obs is not None and "states" in self.last_obs:
+            current_state = np.asarray(self.last_obs["states"])[env_idx]
+        payload = {
+            "env_idx": env_idx,
+            "debug_step": int(self._action_debug_counts[env_idx]),
+            "task_name": self.env_task_names[env_idx],
+            "episode_config_id": self.env_episode_config_ids[env_idx],
+            "episode_config_source": self.episode_config_source,
+            "episode_config_hash": self._current_episode_config_hash(env_idx),
+            "control_mode": self.control_mode,
+            "action_mode": self.action_mode,
+            "policy_action_semantics": "7D xyz_local + euler(rad) + gripper for ee control; unnormalized final policy output",
+            "raw_model_action": policy_action.astype(float).tolist(),
+            "transform_after_prepare_actions": policy_action.astype(float).tolist(),
+            "policy_action": policy_action.astype(float).tolist(),
+            "ctrl_action_shape": list(np.asarray(ctrl_action).shape),
+            "final_env_action": np.asarray(ctrl_action, dtype=float).tolist(),
+            "ctrl_action": np.asarray(ctrl_action, dtype=float).tolist(),
+            "ik_success": None if ik_success is None else bool(ik_success),
+            "current_state": None if current_state is None else np.asarray(current_state, dtype=float).tolist(),
+            "gripper_value": float(policy_action[-1]),
+            "action_space_low": vlabench_jsonable(self.action_space.low),
+            "action_space_high": vlabench_jsonable(self.action_space.high),
+            "clip_applied": False,
+        }
+        append_jsonl(os.path.join(str(self.eval_debug_dir), "action_debug.jsonl"), payload)
+        self._action_debug_counts[env_idx] += 1
+
+    def _validate_ctrl_action(self, env_idx: int, ctrl_action: np.ndarray) -> None:
+        cfg = self.action_validation_cfg
+        if not bool(cfg.get("enabled", True)):
+            return
+        ctrl_action = np.asarray(ctrl_action, dtype=np.float32).reshape(-1)
+        expected_dim = int(self.envs[env_idx].physics.model.nu)
+        if ctrl_action.shape != (expected_dim,):
+            raise ValueError(
+                f"VLABench final env ctrl action dim mismatch: expected {expected_dim}, got {ctrl_action.shape}"
+            )
+        if not np.all(np.isfinite(ctrl_action)):
+            raise ValueError(f"VLABench final env ctrl action is not finite: {ctrl_action.tolist()}")
+        ctrlrange = np.asarray(getattr(self.envs[env_idx].physics.model, "actuator_ctrlrange", []), dtype=np.float32)
+        if ctrlrange.shape == (expected_dim, 2) and bool(cfg.get("check_actuator_ctrlrange", True)):
+            tolerance = float(cfg.get("ctrlrange_tolerance", 1e-4))
+            active_range = ctrlrange[:, 1] > ctrlrange[:, 0]
+            if np.any(active_range):
+                low = ctrlrange[:, 0] - tolerance
+                high = ctrlrange[:, 1] + tolerance
+                out_of_range = active_range & ((ctrl_action < low) | (ctrl_action > high))
+                if np.any(out_of_range):
+                    bad = np.where(out_of_range)[0].tolist()
+                    raise ValueError(
+                        "VLABench final env ctrl action exceeds actuator_ctrlrange at "
+                        f"indices {bad}: action={ctrl_action.tolist()}, ctrlrange={ctrlrange.tolist()}"
+                    )
 
     def _step_one(self, env_idx: int, action):
         if self._episode_done[env_idx]:
@@ -1106,6 +1311,8 @@ class VLABenchEnv(gym.Env):
                 bool(self._last_done_truncation[env_idx]),
                 self._last_done_info[env_idx],
             )
+
+        self._validate_policy_action(env_idx, action)
 
         if self.control_mode == "joint":
             ctrl_action, ik_success = joint_action_to_ctrl(
@@ -1129,6 +1336,8 @@ class VLABenchEnv(gym.Env):
                 delta_position_clip=self.delta_position_clip,
                 delta_rotation_clip=self.delta_rotation_clip,
             )
+        self._validate_ctrl_action(env_idx, ctrl_action)
+        self._write_action_debug(env_idx, np.asarray(action, dtype=np.float32), ctrl_action, ik_success)
         self.envs[env_idx].step(ctrl_action)
         self.elapsed_steps[env_idx] += 1
 
@@ -1178,6 +1387,8 @@ class VLABenchEnv(gym.Env):
                 raise ValueError(
                     f"VLABenchEnv.step expects [B, {action_dim}] for B={self.num_envs}, got {actions.shape}"
                 )
+        if bool(self.action_validation_cfg.get("enabled", True)) and not np.all(np.isfinite(actions)):
+            raise ValueError(f"VLABenchEnv.step received non-finite actions: {actions}")
         actions = np.nan_to_num(actions, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
         return actions, input_was_single
 
@@ -1240,6 +1451,8 @@ class VLABenchEnv(gym.Env):
                     f"VLABenchEnv.chunk_step expects [B, {action_dim}] or [B, T, {action_dim}] "
                     f"for B={self.num_envs}, got {actions.shape}"
                 )
+        if bool(self.action_validation_cfg.get("enabled", True)) and not np.all(np.isfinite(actions)):
+            raise ValueError(f"VLABenchEnv.chunk_step received non-finite actions: {actions}")
         return np.nan_to_num(actions, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
 
     def chunk_step(self, chunk_actions):

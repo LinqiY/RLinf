@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import json
+import os
 
 import hydra
 import torch.multiprocessing as mp
@@ -36,7 +37,12 @@ mp.set_start_method("spawn", force=True)
 def main(cfg) -> None:
     cfg.runner.task_type = "embodied_eval"
     cfg = validate_cfg(cfg)
-    print(json.dumps(OmegaConf.to_container(cfg, resolve=True), indent=2))
+    resolved_cfg = OmegaConf.to_container(cfg, resolve=True)
+    print(json.dumps(resolved_cfg, indent=2))
+    log_path = cfg.runner.logger.get("log_path", None)
+    if log_path:
+        os.makedirs(str(log_path), exist_ok=True)
+        OmegaConf.save(config=cfg, f=os.path.join(str(log_path), "config.yaml"), resolve=True)
 
     cluster = Cluster(cluster_cfg=cfg.cluster)
     component_placement = HybridComponentPlacement(cfg, cluster)

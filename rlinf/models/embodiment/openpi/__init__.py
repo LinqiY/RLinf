@@ -13,6 +13,7 @@
 # limitations under the License.
 # openpi model configs
 
+import json
 import os
 import pathlib
 
@@ -22,6 +23,20 @@ from omegaconf import DictConfig
 from rlinf.utils.logging import get_logger
 
 _LOGGER = get_logger()
+
+
+def _transform_names(transforms_list):
+    return [type(item).__name__ for item in transforms_list]
+
+
+def _write_model_debug_metadata(path, payload):
+    if not path:
+        return
+    directory = os.path.dirname(str(path))
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False, default=str)
 
 
 def get_model(cfg: DictConfig, torch_dtype=None):
@@ -245,5 +260,42 @@ def get_model(cfg: DictConfig, torch_dtype=None):
         ("data_transforms.outputs", transforms.compose(data_config.data_transforms.outputs)),
         ("repack_transforms.outputs", transforms.compose(repack_transforms.outputs)),
     ]
+    debug_metadata = {
+        "model_path": model_path_str,
+        "checkpoint_dir": checkpoint_dir,
+        "weight_source": weight_source,
+        "missing_keys": missing_keys,
+        "unexpected_keys": unexpected_keys,
+        "requested_config_name": config_name,
+        "actor_train_config_name": actor_train_config.name,
+        "data_config_asset_id": data_config.asset_id,
+        "data_config_repo_id": data_config.repo_id,
+        "norm_stats_path": norm_stats_path,
+        "action_dim": actor_model_config.action_dim,
+        "action_horizon": actor_model_config.action_horizon,
+        "action_chunk": actor_model_config.action_chunk,
+        "action_env_dim": actor_model_config.action_env_dim,
+        "state_dim": actor_model_config.action_dim,
+        "image_key_mapping": {
+            "main_images": "observation/image -> base_0_rgb",
+            "extra_view_images[:, 0]": "observation/second_image -> left_wrist_0_rgb",
+            "extra_view_images[:, -1]": "observation/wrist_image -> right_wrist_0_rgb",
+        },
+        "state_key_mapping": {"states": "observation/state -> padded OpenPI state"},
+        "action_key_mapping": {
+            "raw_model_action": "padded delta action",
+            "final_action": "first 7 dims xyz_local + euler(rad) + gripper",
+        },
+        "input_transforms": _transform_names(repack_transforms.inputs)
+        + _transform_names(data_config.data_transforms.inputs)
+        + ["Normalize"]
+        + _transform_names(data_config.model_transforms.inputs),
+        "output_transforms": _transform_names(data_config.model_transforms.outputs)
+        + ["Unnormalize"]
+        + _transform_names(data_config.data_transforms.outputs)
+        + _transform_names(repack_transforms.outputs),
+    }
+    model.vlabench_debug_metadata = debug_metadata
+    _write_model_debug_metadata(getattr(cfg, "debug_metadata_path", None), debug_metadata)
 
     return model

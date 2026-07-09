@@ -1,0 +1,147 @@
+defaults:
+  - env/vlabench_select_fruit@env.eval
+  - model/pi0@rollout.model
+  - override hydra/job_logging: stdout
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    env,rollout: 0
+
+runner:
+  task_type: embodied_eval
+  logger:
+    log_path: outputs/vlabench/vlabench_pi0_primitive_eval
+    project_name: rlinf
+    experiment_name: vlabench_pi0_primitive_eval
+    logger_backends: ["tensorboard"]
+
+  max_epochs: 1
+  max_steps: -1
+
+  only_eval: true
+  val_check_interval: -1
+  save_interval: -1
+
+  resume_dir: null
+  ckpt_path: null
+
+env:
+  group_name: EnvGroup
+
+  eval:
+    # VLABench official primitive in-distribution split: 10 tasks x 50 configs.
+    vlabench_root_path: ${oc.env:VLABENCH_ROOT}
+    task_name: null
+    task_names:
+      - select_fruit
+      - select_drink
+      - select_mahjong
+      - select_poker
+      - select_book
+      - select_toy
+      - select_painting
+      - add_condiment
+      - insert_flower
+      - select_chemistry_tube
+    eval_track: track_1_in_distribution
+    episode_config_path: null
+    require_episode_config: true
+    task_sample_mode: sequential
+    episode_config_sample_mode: sequential
+
+    # 10 parallel envs x 50 rollout epochs covers all 500 official configs.
+    rollout_epoch: 50
+    total_num_envs: 10
+    num_envs: 10
+    group_size: 10
+    seed: 0
+    vector_mode: subprocess
+
+    control_mode: ee
+    action_mode: absolute_ee
+    reward_mode: success
+
+    auto_reset: false
+    ignore_terminations: false
+    max_episode_steps: 200
+    max_steps_per_rollout_epoch: 200
+    return_tensors: true
+    require_pcd: false
+    is_eval: true
+
+    reset_wait_step: 10
+    random_init: false
+    camera_id: 2
+    use_extra_views: true
+    render_height: 256
+    render_width: 256
+
+    action_validation:
+      enabled: true
+      max_abs_xyz: 2.0
+      max_step_xyz_delta: 0.5
+      max_abs_euler: 12.566370614359172
+      max_step_euler_delta: 3.142592653589793
+      gripper_min: -1.0
+      gripper_max: 2.0
+      allow_clip: false
+
+    vlabench_eval:
+      export_results: true
+      result_path: ${runner.logger.log_path}/results.jsonl
+      summary_path: ${runner.logger.log_path}/summary.json
+      summary_csv_path: ${runner.logger.log_path}/summary.csv
+      debug_dir: ${runner.logger.log_path}/debug
+      debug_action_steps: 5
+      debug_observations: true
+      export_format: jsonl
+
+    video_cfg:
+      save_video: true
+      info_on_video: true
+      video_base_dir: ${runner.logger.log_path}/videos
+
+rollout:
+  group_name: RolloutGroup
+  generation_backend: huggingface
+  recompute_logprobs: false
+  enable_offload: false
+  pipeline_stage_num: 1
+
+  model:
+    model_path: ${oc.env:VLABENCH_PI0_PRIMITIVE_CKPT}
+    model_type: openpi
+    precision: null
+    debug_metadata_path: ${runner.logger.log_path}/debug/checkpoint_config_debug.json
+
+    num_action_chunks: 10
+    action_dim: 7
+    num_steps: 4
+    add_value_head: false
+    use_proprio: true
+    is_lora: false
+    lora_rank: 32
+
+    openpi:
+      config_name: pi0_ft_vlabench_primitive
+      num_images_in_input: 3
+      noise_level: 0.5
+      action_chunk: ${..num_action_chunks}
+      num_steps: ${..num_steps}
+      train_expert_only: true
+      action_env_dim: ${..action_dim}
+      noise_method: flow_sde
+      add_value_head: ${..add_value_head}
+      detach_critic_input: false
+
+    openpi_data:
+      repo_id: vlabench/vlabench_ft_primitive

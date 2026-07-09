@@ -26,6 +26,12 @@ setup_sim_env() {
     # POLARIS dataset
     export POLARIS_DATA_PATH="${POLARIS_DATA_PATH:-/path/to/dataset/PolaRiS-Hub}"
 
+    # VLABench
+    export VLABENCH_REPO_PATH="${VLABENCH_REPO_PATH:-$(cd "${REPO_PATH}/.." && pwd)/VLABench}"
+    export VLABENCH_ROOT="${VLABENCH_ROOT:-${VLABENCH_REPO_PATH}/VLABench}"
+    export VLABENCH_PI0_PRIMITIVE_CKPT="${VLABENCH_PI0_PRIMITIVE_CKPT:-$(cd "${REPO_PATH}/.." && pwd)/checkpoints/pi0-primitive-10task-torch}"
+    export PYTHONPATH="${VLABENCH_REPO_PATH}:${PYTHONPATH}"
+
     export ROBOTWIN_PATH="${ROBOTWIN_PATH:-/path/to/RoboTwin}"
     export PYTHONPATH="${REPO_PATH}:${ROBOTWIN_PATH}:${PYTHONPATH}"
 
@@ -47,6 +53,7 @@ infer_benchmark() {
         calvin_*|calvin-* ) echo "calvin" ;;
         roboverse_*|roboverse-* ) echo "roboverse" ;;
         polaris_*|polaris-* ) echo "polaris" ;;
+        vlabench_*|vlabench-* ) echo "vlabench" ;;
         * )
             echo "unknown"
             ;;
@@ -190,7 +197,11 @@ else
 fi
 
 echo "Using Python at $(which python)"
-LOG_DIR="${REPO_PATH}/logs/$(date +'%Y%m%d-%H:%M:%S')-${CONFIG_NAME}"
+if [ "${BENCHMARK}" = "vlabench" ]; then
+    LOG_DIR="${REPO_PATH}/outputs/vlabench/$(date +'%Y%m%d-%H:%M:%S')-${CONFIG_NAME}"
+else
+    LOG_DIR="${REPO_PATH}/logs/$(date +'%Y%m%d-%H:%M:%S')-${CONFIG_NAME}"
+fi
 
 MEGA_LOG_FILE="${LOG_DIR}/eval_embodiment.log"
 

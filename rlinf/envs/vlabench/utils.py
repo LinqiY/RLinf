@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import logging
 import os
 import sys
 from typing import Any
@@ -14,6 +15,7 @@ import numpy as np
 from omegaconf import OmegaConf
 
 DEFAULT_EE_FRAME_OFFSET = np.array([0.0, -0.4, 0.78], dtype=np.float32)
+LOGGER = logging.getLogger(__name__)
 
 
 def ensure_vlabench_importable():
@@ -139,10 +141,20 @@ def cfg_to_container(value: Any) -> Any:
 
 
 def normalize_task_names(cfg: Any, episode_configs: Any = None) -> list[str]:
+    task_names = cfg_to_container(get_cfg_value(cfg, "task_names", None))
     if isinstance(episode_configs, dict) and episode_configs:
+        if task_names is not None:
+            if isinstance(task_names, str):
+                task_names = [task_names]
+            names = [str(name) for name in task_names if str(name)]
+            missing = [name for name in names if name not in episode_configs]
+            if missing:
+                raise ValueError(
+                    f"VLABench task_names {missing} are not present in episode configs"
+                )
+            return names
         return [str(name) for name in episode_configs.keys()]
 
-    task_names = cfg_to_container(get_cfg_value(cfg, "task_names", None))
     if task_names is None:
         task_name = get_cfg_value(cfg, "task_name", None)
         return [str(task_name)] if task_name else []
@@ -157,7 +169,10 @@ def normalize_task_names(cfg: Any, episode_configs: Any = None) -> list[str]:
 def resolve_episode_config_path(cfg: Any) -> str | None:
     path = get_cfg_value(cfg, "episode_config_path", None)
     if path:
-        return str(path)
+        path = str(path)
+        if os.path.exists(path):
+            return path
+        raise FileNotFoundError(f"VLABench episode_config_path does not exist: {path}")
 
     eval_track = get_cfg_value(cfg, "eval_track", None)
     if not eval_track:
@@ -166,7 +181,7 @@ def resolve_episode_config_path(cfg: Any) -> str | None:
     if os.path.exists(eval_track):
         return eval_track
 
-    root = os.environ.get("VLABENCH_ROOT")
+    root = get_cfg_value(cfg, "vlabench_root_path", None) or os.environ.get("VLABENCH_ROOT")
     if root:
         candidate = os.path.join(
             root,
@@ -189,11 +204,21 @@ def load_episode_configs(cfg: Any) -> tuple[list[dict] | dict[str, Any] | None, 
 
     path = resolve_episode_config_path(cfg)
     if path is None:
+        if bool(get_cfg_value(cfg, "require_episode_config", False)):
+            raise FileNotFoundError(
+                "VLABench require_episode_config=true but neither episode_configs, "
+                "episode_config_path, nor a resolvable eval_track was provided. "
+                "Refusing to fall back to random reset for benchmark evaluation."
+            )
         if get_cfg_value(cfg, "eval_track", None):
             raise FileNotFoundError(
                 "Could not resolve VLABench eval_track. Expected "
                 "$VLABENCH_ROOT/configs/evaluation/tracks/{eval_track}.json or an explicit path."
             )
+        LOGGER.warning(
+            "VLABench episode configs were not provided; falling back to random reset. "
+            "Set require_episode_config=true for benchmark evaluation."
+        )
         return None, None
 
     if str(path).endswith(".json"):
